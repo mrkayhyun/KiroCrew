@@ -945,6 +945,7 @@ class _ChatSlot:
         "_end_wait_request",
         "_wait_last_ping",
         "_wait_contested",
+        "_question_pending",
     )
 
     def __init__(
@@ -1343,6 +1344,20 @@ class _ChatSlot:
         # expired it on a timer, which let whichever sleep pinged first after
         # expiry re-publish its deadline onto the other's pill.
         self._wait_contested: bool = False
+        # An agent question this slot has not answered yet:
+        # ``{"ts": float, "blocking": bool, "card_id": str}``, else None. A
+        # question card is a websocket broadcast with no transcript row, so
+        # without this record the only surface that knows the agent is waiting is
+        # the browser tab that happened to receive the card — a reload, a second
+        # window, or the sessions board sees a quiet, finished-looking session.
+        # ``blocking`` distinguishes an ask_question HTTP round-trip (the turn is
+        # parked on the answer) from the stateless card (the turn has ended and
+        # the answer arrives as the next message), which is the difference
+        # between "the agent is stuck" and "the agent is done and asked you
+        # something". ``card_id`` is the ask's identity — the ask_id for a
+        # blocking round-trip, a minted one for a stateless card — so a dismissal
+        # for one card cannot retire the record of the card that replaced it.
+        self._question_pending: dict | None = None
 
     @property
     def _dirty(self) -> bool:
@@ -1470,6 +1485,20 @@ class _ChatSlot:
         broadcast_user: bool = False,
         meta: dict | None = None,
     ) -> None:
+        # A user row is turn-consuming input, so it retires an unanswered
+        # STATELESS question: the card's own submit path sends one, and typing
+        # something else is the user answering by other means (or moving on).
+        # Retiring here rather than at the composer covers every entrance —
+        # queued dispatch, a nudge, a channel-replayed row — instead of the one
+        # send site that happens to be in front of the user.
+        #
+        # A BLOCKING record is deliberately left alone: nothing a user row can do
+        # resolves the parked wait, so clearing it would report the agent as
+        # working while its tool call is still stuck on the answer. That record is
+        # owned by the round-trip in request_question, which retires it on every
+        # exit.
+        if role == "user" and not (self._question_pending or {}).get("blocking"):
+            self._question_pending = None
         msg: dict[str, Any] = {
             "role": role,
             "content": content,
@@ -1989,6 +2018,26 @@ class _ChatSlot:
             and bool(self.messages)
             and last_conv_role == "assistant"
         )
+        # needs_input: the agent ASKED the user something and cannot move past it
+        # — an unanswered question card, or a turn that ended with an [OPTIONS:]
+        # tag (the fallback the model uses when no card can be rendered).
+        #
+        # Deliberately narrower than `waiting_for_input`, which is true of every
+        # ordinary finished turn: a status that lights on all of them says
+        # nothing, and the sidebar's unread dot already covers that case. It is
+        # also separate from `pending_approval`, whose answer is allow/deny on a
+        # tool rather than input, and which keeps its own precedence and label.
+        #
+        # NOT gated on `self.running`: a blocking ask_question parks the turn
+        # mid-flight, so the session is running AND waiting on the user.
+        # `reason` is a discriminator for the label, not a severity: "question"
+        # outranks "options" because a card is the live surface when both are
+        # somehow present.
+        needs_input_reason = ""
+        if self._question_pending is not None:
+            needs_input_reason = "question"
+        elif has_options:
+            needs_input_reason = "options"
         # If an approval is pending, surface the tool metadata from the most
         # recent unresolved permission message so the Board can show inline
         # Approve/Trust/Reject buttons without a second API call.
@@ -2045,6 +2094,8 @@ class _ChatSlot:
             "pending_approval_info": pending_approval_info,
             "last_activity_ts": last_activity_ts,
             "waiting_for_input": waiting_for_input,
+            "needs_input": bool(needs_input_reason),
+            "needs_input_reason": needs_input_reason,
             "stop_state": self._stop_state,
             # In-flight `wait` sleep, or None. Carries the absolute deadline the
             # transcript counts down against and the wait_id the "End wait"
@@ -3042,8 +3093,87 @@ class DashboardState:
         :meth:`_redact_questions` (may raise ``ValueError`` on a post-redaction
         collapse). Owner-only, same grounds as request_question's broadcast."""
         safe_questions = self._redact_questions(questions)
-        payload = {"slot": slot_key, "questions": safe_questions, "ts": time.time()}
+        card_id = f"card-{uuid.uuid4().hex[:16]}"
+        # Recorded BEFORE the delivery await, and even when nothing is delivered.
+        # Ordering: delivery can park on a backpressured socket, and a user row
+        # landing in that window would find no record to retire — then the mark
+        # would arrive afterwards and strand an answered session in needs_input.
+        # Zero clients means no tab is open, not that the ask went away: the agent
+        # is still waiting, and the status is what says so when the user returns.
+        self.mark_question_pending(slot_key, blocking=False, card_id=card_id)
+        payload = {
+            "slot": slot_key,
+            "card_id": card_id,
+            "questions": safe_questions,
+            "ts": time.time(),
+        }
         return int(await self.deliver_ws_owners("question_card", payload))
+
+    def mark_question_pending(self, slot_key: str, *, blocking: bool, card_id: str = "") -> None:
+        """Record an unanswered agent question on *slot_key* and push the status.
+
+        Unknown slot keys are ignored: a question addressed at a slot that no
+        longer exists has nobody to show a status to, and the caller's own
+        no-slot handling (a 404 from the HTTP endpoint, a dropped broadcast)
+        already covers the case.
+        """
+        slot = self._slots.get(slot_key)
+        if slot is None:
+            return
+        slot._question_pending = {
+            "ts": time.time(),
+            "blocking": blocking,
+            "card_id": card_id,
+        }
+        self._push_slots()
+
+    def clear_question_pending(
+        self,
+        slot_key: str,
+        *,
+        blocking: bool | None = None,
+        card_id: str | None = None,
+    ) -> bool:
+        """Retire *slot_key*'s unanswered-question record. True if one was set.
+
+        Two independent filters, both refusing rather than clearing on a
+        mismatch:
+
+        ``blocking`` — retire only a record with that flag, so two overlapping
+        asks on one slot cannot retire each other's status, and the dismiss route
+        cannot report a session as unblocked while its tool call is still parked.
+
+        ``card_id`` — retire only THAT ask. A dismissal is a round-trip, so the
+        card it was clicked on can be replaced by a newer one before the request
+        lands; a slot-only clear would then retire the new card's status and leave
+        it unanswered but unmarked.
+
+        The return value is the caller's proof that something changed, which is
+        what lets the dismiss endpoint answer 404 for a card that is already gone
+        instead of reporting a no-op as success.
+        """
+        slot = self._slots.get(slot_key)
+        if slot is None or slot._question_pending is None:
+            return False
+        if blocking is not None and bool(slot._question_pending.get("blocking")) != blocking:
+            return False
+        if card_id is not None and str(slot._question_pending.get("card_id") or "") != card_id:
+            return False
+        slot._question_pending = None
+        self._push_slots()
+        return True
+
+    def _push_slots(self) -> None:
+        """Broadcast a slots snapshot, swallowing a failure.
+
+        A status marker is not worth propagating an exception into the question
+        round-trip it decorates: the payload is rebuilt from slot state on every
+        later push, so a dropped one self-corrects.
+        """
+        try:
+            self.push_slots_update()
+        except Exception:
+            self._log.debug("push_slots_update failed after question status change", exc_info=True)
 
     async def request_question(
         self,
@@ -3080,6 +3210,11 @@ class DashboardState:
         # Registered only now that the payload is known-good: an early raise
         # above must not leave an orphan future nothing will ever resolve.
         self._question_futures[ask_id] = fut
+        # Same record the stateless card sets, flagged blocking and identified by
+        # the ask_id: this turn is parked on the answer, so the session reads as
+        # running AND waiting. Marked before the broadcast, so no client can act
+        # on a card the status does not yet know about.
+        self.mark_question_pending(slot_key, blocking=True, card_id=ask_id)
         # Owner-only: the payload carries the model-authored question text and
         # options addressed to the dashboard owner. A plain broadcast_ws would
         # also deliver it to non-owner sessions, which would defeat the
@@ -3097,6 +3232,12 @@ class DashboardState:
         finally:
             self._pending_questions.pop(ask_id, None)
             self._question_futures.pop(ask_id, None)
+            # One retirement point for every exit — answered, dismissed, timed
+            # out, cancelled — so no path can leave the slot claiming it is
+            # still waiting on a question nothing is blocked on. Scoped to THIS
+            # ask's record (blocking, by ask_id), so a question that overlapped
+            # this one keeps its own status.
+            self.clear_question_pending(slot_key, blocking=True, card_id=ask_id)
             # Tell every owner client to drop the card — otherwise a timed-out
             # or cancelled question stays clickable and submitting it 404s.
             # Owner-scoped to match the card broadcast: a non-owner never

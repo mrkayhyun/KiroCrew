@@ -56,7 +56,12 @@ export default function PendingQuestionCard({ slotKey, onFallbackSend, onDirectS
 
   const cardSlot = pending.slot
   const askId = pending.ask_id
-  const busy = !!askId && busyFor === askId
+  /* What an in-flight request is keyed by. A stateless dismiss is now a
+     round-trip too, so it needs the same one-at-a-time guard the blocking
+     resolve has — keyed by the ask's identity rather than a bare boolean, for
+     the reason above. */
+  const lockKey = askId ?? pending.serverCardId ?? cardSlot
+  const busy = busyFor === lockKey
   const asText = (answers: Record<string, string>) => Object.values(answers).join('\n')
 
   /* Clearing by ask_id, never by slot: a slow response for ask A must not erase
@@ -101,6 +106,44 @@ export default function PendingQuestionCard({ slotKey, onFallbackSend, onDirectS
       })
   }
 
+  /** Dismiss a STATELESS card: nothing is blocked, so the only thing to undo is
+   *  the slot's needs_input status.
+   *
+   *  The local card is cleared only once the server has confirmed it. Clearing
+   *  first and firing the request off unguarded looks harmless — the card is
+   *  "just" a local widget — but on a transient failure it leaves the record set
+   *  with the control that could clear it gone: every status surface then claims
+   *  the agent is waiting until some later message happens to retire it. Keeping
+   *  the card on a retryable error is the same trade the blocking path above
+   *  makes, for the same reason.
+   *
+   *  A card with no server identity (an older payload, or a fixture) is cleared
+   *  locally without a request: there is no record this dismissal could name, and
+   *  a slot-only clear is exactly what the identity check exists to prevent. */
+  const dismissStateless = () => {
+    if (busy) return
+    const cardId = pending.serverCardId
+    if (!cardId) {
+      clearThisCard()
+      return
+    }
+    setBusyFor(lockKey)
+    api
+      .dismissQuestionCard(cardSlot, cardId)
+      .then(() => clearThisCard())
+      .catch((err) => {
+        // 404 means the server holds no such record — already retired by a
+        // message, by a newer card, or by a restart. The card on screen is stale,
+        // so take it away.
+        if (err instanceof ApiError && err.status === 404) clearThisCard()
+        // Anything else is retryable: keep the card, and with it the only control
+        // that can retire the status.
+      })
+      .finally(() => {
+        setBusyFor((current) => (current === lockKey ? null : current))
+      })
+  }
+
   return (
     <QuestionCard
       // Remount per ask: QuestionCard holds the selections and custom-answer
@@ -114,10 +157,10 @@ export default function PendingQuestionCard({ slotKey, onFallbackSend, onDirectS
       // nudge frame landing mid-typing cannot destroy the user's work.
       onDraftChange={(active) => dispatch(setQuestionDraft({ slot: cardSlot, active }))}
       // Always offered. A blocked card resolves the wait with no answer; a
-      // legacy card blocks nothing, so dismiss just takes it off screen —
-      // withholding the control there left a card that could ONLY be answered,
-      // parked on top of the composer until the session was reset.
-      onDismiss={() => { if (askId) resolve(undefined); else clearThisCard() }}
+      // legacy card blocks nothing, so dismiss only has its needs_input status
+      // to retire — withholding the control left a card that could ONLY be
+      // answered, parked on top of the composer until the session was reset.
+      onDismiss={() => { if (askId) resolve(undefined); else dismissStateless() }}
       onSubmit={(answers) => {
         if (!askId) {
           // Legacy card: nothing is blocked, so the answer is just a message —

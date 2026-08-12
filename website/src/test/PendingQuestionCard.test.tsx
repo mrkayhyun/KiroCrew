@@ -64,7 +64,11 @@ const withCard = (askId?: string) =>
     chat: {
       activeSlot: 'chat-1',
       pendingQuestions: {
-        'chat-1': { slot: 'chat-1', ...(askId ? { ask_id: askId } : {}), questions: QUESTIONS },
+        'chat-1': {
+          slot: 'chat-1',
+          ...(askId ? { ask_id: askId } : { serverCardId: 'card-1' }),
+          questions: QUESTIONS,
+        },
       },
     },
   } as never)
@@ -178,8 +182,9 @@ describe('PendingQuestionCard — round 6 findings', () => {
     expect(screen.getByText('staging')).toBeInTheDocument()
   })
 
-  it('offers a dismiss control on a legacy card, which just takes it off screen', () => {
+  it('offers a dismiss control on a legacy card, which retires its status', async () => {
     const answer = vi.spyOn(api, 'answerQuestion')
+    const dismissStatus = vi.spyOn(api, 'dismissQuestionCard').mockResolvedValue({ ok: true } as never)
     const store = withCard()
     const onFallbackSend = renderCard(store)
 
@@ -190,7 +195,70 @@ describe('PendingQuestionCard — round 6 findings', () => {
 
     expect(answer).not.toHaveBeenCalled()
     expect(onFallbackSend).not.toHaveBeenCalled()
+    // The server hears about it BY CARD IDENTITY: the slot's needs_input status is
+    // what the sidebar and sessions board read, and a newer card must not inherit
+    // this dismissal.
+    expect(dismissStatus).toHaveBeenCalledWith('chat-1', 'card-1')
+    await waitFor(() => expect(pendingOf(store)).toBeUndefined())
+  })
+
+  it('keeps a legacy card on screen when the dismissal fails', async () => {
+    // Clearing first and firing the request off unguarded leaves the record set
+    // with the only control that could retire it gone: every status surface then
+    // claims the agent is waiting, with nothing on screen to fix it.
+    vi.spyOn(api, 'dismissQuestionCard').mockRejectedValue(new ApiError(503, 'offline'))
+    const store = withCard()
+    renderCard(store)
+
+    fireEvent.click(screen.getByLabelText('Dismiss question without answering'))
+
+    await waitFor(() => expect(pendingOf(store)).toBeDefined())
+    // …and the control is usable again for a retry.
+    const dismiss = screen.getByLabelText('Dismiss question without answering') as HTMLButtonElement
+    await waitFor(() => expect(dismiss.disabled).toBe(false))
+  })
+
+  it('drops a legacy card when the server says there is no such record (404)', async () => {
+    // Already retired by a message, a newer card, or a restart — the card on
+    // screen is stale, so it goes.
+    vi.spyOn(api, 'dismissQuestionCard').mockRejectedValue(new ApiError(404, 'gone'))
+    const store = withCard()
+    renderCard(store)
+
+    fireEvent.click(screen.getByLabelText('Dismiss question without answering'))
+
+    await waitFor(() => expect(pendingOf(store)).toBeUndefined())
+  })
+
+  it('clears a legacy card with no server identity without calling the route', () => {
+    // Nothing to name: a slot-only clear is exactly what the identity check
+    // exists to prevent, so the card is just removed locally.
+    const dismissStatus = vi.spyOn(api, 'dismissQuestionCard')
+    const store = createTestStore({
+      chat: {
+        activeSlot: 'chat-1',
+        pendingQuestions: { 'chat-1': { slot: 'chat-1', questions: QUESTIONS } },
+      },
+    } as never)
+    renderCard(store)
+
+    fireEvent.click(screen.getByLabelText('Dismiss question without answering'))
+
+    expect(dismissStatus).not.toHaveBeenCalled()
     expect(pendingOf(store)).toBeUndefined()
+  })
+
+  it('does not touch the status route when dismissing a BLOCKING card', () => {
+    // The answer endpoint owns that lifecycle: the status retires when the wait
+    // resolves. Calling the stateless route here would report the session as
+    // unblocked while its tool call is still parked.
+    vi.spyOn(api, 'answerQuestion').mockResolvedValue({ ok: true } as never)
+    const dismissStatus = vi.spyOn(api, 'dismissQuestionCard')
+    renderCard(withCard('ask-1'))
+
+    fireEvent.click(screen.getByLabelText('Dismiss question without answering'))
+
+    expect(dismissStatus).not.toHaveBeenCalled()
   })
 })
 
@@ -501,11 +569,12 @@ describe('reconnect re-dispatch', () => {
     expect(screen.getByDisplayValue('still typing')).toBeTruthy()
   })
 
-  it('user dismiss removes the card', () => {
-    const store = withCard() // stateless card — dismiss is a pure local clear
+  it('user dismiss removes the card', async () => {
+    vi.spyOn(api, 'dismissQuestionCard').mockResolvedValue({ ok: true } as never)
+    const store = withCard() // stateless card — dismiss only retires its status
     renderCard(store)
     typeCustomAnswer('abandoned on purpose')
     fireEvent.click(screen.getByRole('button', { name: /dismiss/i }))
-    expect(store.getState().chat.pendingQuestions['chat-1']).toBeUndefined()
+    await waitFor(() => expect(store.getState().chat.pendingQuestions['chat-1']).toBeUndefined())
   })
 })

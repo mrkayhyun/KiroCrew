@@ -30,6 +30,11 @@ def _state() -> DashboardState:
     st = DashboardState.__new__(DashboardState)
     st._pending_questions = {}
     st._question_futures = {}
+    # A question records itself on its slot so the session reports needs_input,
+    # so the stub owns a real slot map and a stubbed push — without them the
+    # marker path would AttributeError instead of being exercised.
+    st._slots = {}
+    st.push_slots_update = MagicMock()  # type: ignore[method-assign]
     st.broadcasts: list[tuple[str, dict]] = []  # type: ignore[attr-defined]
     st.broadcasts_all: list[tuple[str, dict]] = []  # type: ignore[attr-defined]
     st.broadcast_ws_owners = lambda kind, payload: st.broadcasts.append(  # type: ignore[assignment,attr-defined]
@@ -473,6 +478,7 @@ def test_ask_question_routes_are_registered() -> None:
     routes = {(r.method, r.resource.canonical) for r in app.router.routes() if r.resource}
     assert ("POST", "/api/ask-question") in routes
     assert ("POST", "/api/ask-question/{ask_id}/answer") in routes
+    assert ("POST", "/api/ask-question/dismiss") in routes
 
 
 # ── Authorization: app tokens are refused (GPT HIGH, round 3) ──
@@ -1030,3 +1036,207 @@ async def test_collision_surfaces_as_400_not_500() -> None:
         resp = await api_ask_question(request)
     assert resp.status == 400
     assert "redaction" in json.loads(resp.text)["error"]
+
+
+# ── Dismissing a stateless card retires its status ──
+
+
+@pytest.mark.asyncio
+async def test_dismiss_retires_a_stateless_card_status() -> None:
+    """A stateless card blocks nothing, so only the status has to be retired.
+
+    Without this route the dismiss was client-side only and the slot went on
+    reporting needs_input — the sidebar and sessions board claiming the agent was
+    waiting on an answer the user had explicitly waved away.
+    """
+    from kiro_crew.dashboard.handlers.ask_question import api_ask_question_dismiss
+    from kiro_crew.dashboard.state import _ChatSlot
+
+    st = _state()
+    st._slots = {"chat-1": _ChatSlot("chat-1")}
+    st.mark_question_pending("chat-1", blocking=False, card_id="card-1")
+    assert st._slots["chat-1"].to_dict()["needs_input"] is True
+
+    request = MagicMock()
+    request.app = {"state": st}
+    _as_owner(request)
+
+    async def _json() -> dict:
+        return {"slot": "chat-1", "card_id": "card-1"}
+
+    request.json = _json
+    resp = await api_ask_question_dismiss(request)
+    assert resp.status == 200
+    assert st._slots["chat-1"].to_dict()["needs_input"] is False
+
+
+@pytest.mark.asyncio
+async def test_dismiss_refuses_a_stale_card_id() -> None:
+    """A dismissal is a round-trip; a newer card must not inherit its clear.
+
+    Dismiss card A, then card B lands before A's request does. Retiring by slot
+    alone would clear B's status and leave B unanswered but unmarked.
+    """
+    from kiro_crew.dashboard.handlers.ask_question import api_ask_question_dismiss
+    from kiro_crew.dashboard.state import _ChatSlot
+
+    st = _state()
+    st._slots = {"chat-1": _ChatSlot("chat-1")}
+    st.mark_question_pending("chat-1", blocking=False, card_id="card-B")
+
+    request = MagicMock()
+    request.app = {"state": st}
+    _as_owner(request)
+
+    async def _json() -> dict:
+        return {"slot": "chat-1", "card_id": "card-A"}
+
+    request.json = _json
+    resp = await api_ask_question_dismiss(request)
+    assert resp.status == 404
+    assert st._slots["chat-1"].to_dict()["needs_input"] is True
+
+
+@pytest.mark.asyncio
+async def test_dismiss_requires_a_card_id() -> None:
+    from kiro_crew.dashboard.handlers.ask_question import api_ask_question_dismiss
+    from kiro_crew.dashboard.state import _ChatSlot
+
+    st = _state()
+    st._slots = {"chat-1": _ChatSlot("chat-1")}
+    st.mark_question_pending("chat-1", blocking=False, card_id="card-1")
+
+    request = MagicMock()
+    request.app = {"state": st}
+    _as_owner(request)
+
+    async def _json() -> dict:
+        return {"slot": "chat-1"}
+
+    request.json = _json
+    resp = await api_ask_question_dismiss(request)
+    assert resp.status == 400
+    assert st._slots["chat-1"].to_dict()["needs_input"] is True
+
+
+@pytest.mark.asyncio
+async def test_dismiss_404s_when_nothing_is_pending() -> None:
+    from kiro_crew.dashboard.handlers.ask_question import api_ask_question_dismiss
+    from kiro_crew.dashboard.state import _ChatSlot
+
+    st = _state()
+    st._slots = {"chat-1": _ChatSlot("chat-1")}
+    request = MagicMock()
+    request.app = {"state": st}
+    _as_owner(request)
+
+    async def _json() -> dict:
+        return {"slot": "chat-1", "card_id": "card-1"}
+
+    request.json = _json
+    resp = await api_ask_question_dismiss(request)
+    assert resp.status == 404
+
+
+@pytest.mark.asyncio
+async def test_dismiss_cannot_clear_a_blocking_question() -> None:
+    """A parked tool call is not dismissible here — that is the answer route's job.
+
+    Clearing it would report the session as unblocked while the ask_question call
+    is still waiting on its future.
+    """
+    from kiro_crew.dashboard.handlers.ask_question import api_ask_question_dismiss
+    from kiro_crew.dashboard.state import _ChatSlot
+
+    st = _state()
+    st._slots = {"chat-1": _ChatSlot("chat-1")}
+    task = asyncio.ensure_future(
+        st.request_question("d1", "chat-1", _questions(), timeout=30)
+    )
+    for _ in range(50):
+        if "d1" in st._question_futures:
+            break
+        await asyncio.sleep(0)
+
+    request = MagicMock()
+    request.app = {"state": st}
+    _as_owner(request)
+
+    async def _json() -> dict:
+        # The blocking ask's own id: the refusal must come from the blocking
+        # filter, not from an unmatched card_id.
+        return {"slot": "chat-1", "card_id": "d1"}
+
+    request.json = _json
+    resp = await api_ask_question_dismiss(request)
+    assert resp.status == 404
+    assert st._slots["chat-1"].to_dict()["needs_input"] is True
+    assert not task.done()
+
+    st.resolve_question("d1", None)
+    assert await task is None
+
+
+@pytest.mark.asyncio
+async def test_dismiss_requires_a_slot() -> None:
+    from kiro_crew.dashboard.handlers.ask_question import api_ask_question_dismiss
+
+    st = _state()
+    st._slots = {}
+    request = MagicMock()
+    request.app = {"state": st}
+    _as_owner(request)
+
+    async def _json() -> dict:
+        return {}
+
+    request.json = _json
+    resp = await api_ask_question_dismiss(request)
+    assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_app_token_cannot_dismiss() -> None:
+    """Same gate as the sibling endpoints: this mutates the owner's own status."""
+    from kiro_crew.dashboard.handlers.ask_question import api_ask_question_dismiss
+    from kiro_crew.dashboard.state import _ChatSlot
+
+    st = _state()
+    st._slots = {"chat-1": _ChatSlot("chat-1")}
+    st.mark_question_pending("chat-1", blocking=False, card_id="card-1")
+    request = MagicMock()
+    request.app = {"state": st}
+    request.__contains__.return_value = True
+    request.get = lambda k, d="": "evil-app" if k == "app" else d
+
+    async def _json() -> dict:
+        return {"slot": "chat-1", "card_id": "card-1"}
+
+    request.json = _json
+    resp = await api_ask_question_dismiss(request)
+    assert resp.status == 403
+    assert "app token" in json.loads(resp.text)["error"]
+    # The status must survive a refused call.
+    assert st._slots["chat-1"].to_dict()["needs_input"] is True
+
+
+@pytest.mark.asyncio
+async def test_non_owner_dashboard_token_cannot_dismiss() -> None:
+    from kiro_crew.dashboard.handlers.ask_question import api_ask_question_dismiss
+    from kiro_crew.dashboard.state import _ChatSlot
+
+    st = _state()
+    st.owner_id = "U_OWNER"
+    st._slots = {"chat-1": _ChatSlot("chat-1")}
+    st.mark_question_pending("chat-1", blocking=False, card_id="card-1")
+    request = MagicMock()
+    request.app = {"state": st}
+    _as_owner(request, user="U_SOMEONE_ELSE")
+
+    async def _json() -> dict:
+        return {"slot": "chat-1", "card_id": "card-1"}
+
+    request.json = _json
+    resp = await api_ask_question_dismiss(request)
+    assert resp.status == 403
+    assert st._slots["chat-1"].to_dict()["needs_input"] is True

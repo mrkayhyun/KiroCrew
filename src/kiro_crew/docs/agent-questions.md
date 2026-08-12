@@ -149,7 +149,18 @@ it fired would otherwise leave the agent blocked with nothing on screen until th
 window elapses. The frontend re-syncs this on websocket open, the same way it
 re-syncs `GET /api/approvals`.
 
-**All three endpoints are owner-only.** Refusing app tokens is not enough: a
+`POST /api/ask-question/dismiss` — retire a STATELESS card's session status.
+Body: `{slot, card_id}` — the slot key and the card identity the `question_card`
+payload carries (not a session key: a channel-born conversation's two keys differ
+and the client holds only the slot). `card_id` is required because the dismissal
+is a round-trip: a newer ask can replace the card before the request lands, and a
+slot-only clear would retire the NEW card's status. 400 without it; 404 when the
+slot holds no stateless record with that id. A blocking ask is deliberately NOT
+dismissible here — it owns its lifecycle through the answer endpoint, and clearing
+its status from this route would report a session as unblocked while its tool call
+is still parked on the wait.
+
+**All four endpoints are owner-only.** Refusing app tokens is not enough: a
 dashboard session token is also minted for every allowed Slack user
 (`!dashboard`), and it carries an empty app claim, so it clears the app gate
 while belonging to someone who is not the owner. That caller could address a card
@@ -168,6 +179,51 @@ all-clients channel. Owner-gating the HTTP endpoints would buy nothing otherwise
 an allowed Slack user's `!dashboard` session registers as an ordinary WS client,
 so a plain `broadcast_ws` would hand them the owner's question text, options, and
 `ask_id` over the socket even though they cannot call the endpoints.
+
+## Session status: `needs_input`
+
+A card is a websocket broadcast with no transcript row, and the `[OPTIONS:]`
+fallback is an ordinary assistant message, so an ask was visible only in the tab
+that happened to receive it. Every slot payload therefore carries two derived
+fields:
+
+| Field | Meaning |
+|---|---|
+| `needs_input` | the agent asked something and cannot move past it |
+| `needs_input_reason` | `"question"` (a card is unanswered), `"options"` (the turn ended with an `[OPTIONS:]` tag), or `""` |
+
+It is deliberately narrower than `waiting_for_input`, which is true of every
+finished turn — a status that lights on all of them carries no information, and
+the sidebar's unread dot already covers that case. It is also separate from
+`pending_approval`, whose answer is allow/deny on a tool rather than input, and
+which keeps its own precedence and label everywhere the two are rendered.
+
+It is **not** gated on `running`: a blocking ask parks the turn mid-flight, so the
+session is running AND waiting on the user. Surfaces rank it directly below the
+approval treatments and above every "working" signal for that reason — otherwise
+a blocked session reads as "Thinking…".
+
+The `"question"` half is a record on the slot — `{ts, blocking, card_id}` — set by
+both `post_question_card` (with a minted `card_id`, which also rides the broadcast
+so a client can name it later) and `request_question` (`card_id` = the `ask_id`).
+It is recorded BEFORE the delivery await, because a backpressured socket would
+otherwise leave a window where a user row finds no record to retire and the mark
+lands after it, stranding an answered session in `needs_input`.
+
+Retirement, and only these paths:
+
+| Path | Retires |
+|---|---|
+| a `user`-role message (composer, queue, nudge, channel replay) | the STATELESS record only |
+| the blocking round-trip's exit (answered / dismissed / timed out / cancelled) | its own record, by `card_id` |
+| `POST /api/ask-question/dismiss` | the stateless record, by `card_id` |
+
+A user row deliberately does not touch a blocking record: nothing it can do
+resolves the parked wait, so clearing it would report the agent as working while
+its tool call is still stuck. Both filters refuse rather than clear on a mismatch,
+so an ask that overlapped another cannot retire the other's status, and the agent's
+own further output never retires anything — a card posted mid-turn outlives the
+lines that follow it.
 
 ## Frontend behaviour
 

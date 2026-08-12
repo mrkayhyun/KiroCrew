@@ -232,6 +232,67 @@ async def api_ask_question_pending(request: web.Request) -> web.Response:
     )
 
 
+async def api_ask_question_dismiss(request: web.Request) -> web.Response:
+    """POST /api/ask-question/dismiss — retire a stateless card's status.
+
+    Body: ``{slot, card_id}`` — the slot key and the card identity the
+    ``question_card`` payload carries. Deliberately not a session key: a
+    channel-born conversation's session key and its slot key differ, and the
+    client holds only the slot. ``card_id`` is required because a dismissal is a
+    round-trip: the card can be replaced by a newer ask before the request lands,
+    and a slot-only clear would retire the NEW card's status, leaving it
+    unanswered with nothing to say so.
+
+    A stateless card (no ``ask_id``) blocks nothing, so dismissing it was purely
+    a client-side removal — and the slot's ``needs_input`` status, which the
+    sidebar and the sessions board read, would go on claiming the agent is
+    waiting on an answer until the next message landed. This is the dismiss half
+    of that record; the answer half retires through the ordinary user message the
+    card's submit sends.
+
+    Owner-only on the same grounds as the other endpoints: it mutates the
+    owner's own session status.
+    """
+    state: DashboardState = request.app["state"]
+    deny = _deny_app_token(request, "ask_question_dismiss")
+    if deny is not None:
+        return deny
+    deny = _deny_non_owner(request, "ask_question_dismiss")
+    if deny is not None:
+        return deny
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response(
+            {"error": "body must be a JSON object", "code": "invalid_body"}, status=400
+        )
+    slot_key = str(body.get("slot") or "")
+    if not slot_key:
+        return web.json_response({"error": "slot is required", "code": "missing_slot"}, status=400)
+    card_id = str(body.get("card_id") or "")
+    if not card_id:
+        return web.json_response(
+            {"error": "card_id is required", "code": "missing_card_id"}, status=400
+        )
+    # Only the stateless record is dismissible here. A blocking ask owns its own
+    # lifecycle through the answer endpoint, and clearing its status from this
+    # route would report a session as unblocked while its tool call is still
+    # parked on the wait. A stale card_id, an unknown slot and an already-retired
+    # record all land here too: from this route's point of view they are one
+    # answer — there is nothing of yours left to dismiss.
+    if not state.clear_question_pending(slot_key, blocking=False, card_id=card_id):
+        return web.json_response(
+            {
+                "error": "no pending question card for that slot and card_id",
+                "code": "question_card_not_found",
+            },
+            status=404,
+        )
+    return web.json_response({"ok": True})
+
+
 async def api_ask_question_answer(request: web.Request) -> web.Response:
     """POST /api/ask-question/{ask_id}/answer — resolve a pending question.
 

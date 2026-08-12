@@ -1885,6 +1885,14 @@ export const api = {
   answerQuestion: (askId: string, answers?: Record<string, string>) =>
     post('/api/ask-question/' + encodeURIComponent(askId) + '/answer',
       answers ? { answers } : { dismissed: true }).then(j),
+  /** Retire the slot's needs-input status for a STATELESS card (no `ask_id`),
+   *  which blocks nothing and is otherwise removed client-side only — leaving
+   *  the sidebar and sessions board claiming the agent is still waiting.
+   *  `cardId` is the server-minted identity from the `question_card` payload:
+   *  the dismissal is a round-trip, so a newer card can replace this one before
+   *  it lands, and the server refuses rather than retiring the wrong ask. */
+  dismissQuestionCard: (slot: string, cardId: string) =>
+    post('/api/ask-question/dismiss', { slot, card_id: cardId }).then(j),
   // Logs
   logLevel: () => fetch('/api/logs/level').then(j),
   setLogLevel: (level: string) => post('/api/logs/level', { level }).then(j),
