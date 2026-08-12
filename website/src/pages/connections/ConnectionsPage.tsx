@@ -13,7 +13,7 @@ import {
   Unplug,
   X,
 } from 'lucide-react'
-import { api } from '../../api/client'
+import { api, type ConnectionMintState } from '../../api/client'
 import { useAppSelector } from '../../store'
 import type { ChatMessage, McpApplyChange, McpServer } from '../../types'
 import { fmtDate } from '../../i18n/format'
@@ -25,6 +25,10 @@ import {
   serverForConnection,
   type ConnectionProvider,
 } from './registry'
+
+/** Mint poll cadence. A cold mint takes seconds, so this is tuned to surface the
+ *  URL promptly without spinning on a request that mostly answers `minting`. */
+const MINT_POLL_MS = 2_000
 
 export type ConnectionCardState =
   | 'not-connected'
@@ -44,6 +48,8 @@ export type OAuthState = {
   oauthUrl: string
   error: string
   timestamp: number
+  /** The URL was minted on demand, so no browser tab was ever opened for it. */
+  minted?: boolean
 }
 
 const PROVIDER_TONES: Record<string, string> = {
@@ -90,6 +96,11 @@ export interface PendingConnect {
    *  fencing against a *snapshot of them* stays within one clock domain —
    *  never compare them to the browser's own wall clock. */
   sinceTs: number
+  /** The mint row token this tab's own POST returned. The mint table is keyed by
+   *  slug, so a sibling tab connecting the same provider replaces the row; the
+   *  token is the only way this tab can tell its own terminal state from the
+   *  sibling's before acting on the entry. */
+  token?: number
 }
 
 /** A banner no newer than the snapshot taken at click time belongs to a prior
@@ -101,6 +112,110 @@ export function effectiveOAuth(
 ): OAuthState | undefined {
   if (oauth && pending && oauth.timestamp <= pending.sinceTs) return undefined
   return oauth
+}
+
+/** Fold a minted approval URL into the card's OAuth view.
+ *
+ * Applied AFTER `effectiveOAuth`, so a minted URL never passes through the
+ * banner staleness fence: a mint is started by the click being served, so it is
+ * current by construction and carries no gateway banner timestamp to compare
+ * against. A URL is taken only from a `waiting` mint — every other state either
+ * has no URL or holds one that can no longer be redeemed.
+ *
+ * A chat banner that already carries a URL wins: it is the same consent request,
+ * and preferring one source keeps the rendered link stable across polls.
+ */
+/** What a mint state means for the card, given how the entry got there.
+ *
+ *  The full table — every mint state against both entry situations — so the card
+ *  implements a decision rather than accumulating one branch per review round:
+ *
+ *  | mint state | entry           | wait  | probe | error | uninstall |
+ *  |------------|-----------------|-------|-------|-------|-----------|
+ *  | absent     | either          | keep  |  no   |  no   |    no     |
+ *  | minting    | either          | keep  |  no   |  no   |    no     |
+ *  | waiting    | either          | keep  |  no   |  no   |    no     |
+ *  | granted    | either          | clear | YES   |  no   |    no     |
+ *  | failed     | new-this-flow   | clear |  no   | YES   |    no     |
+ *  | failed     | pre-existing    | clear |  no   | YES   |    no     |
+ *  | expired    | new-this-flow   | clear |  no   |  no   |   YES*    |
+ *  | expired    | pre-existing    | clear |  no   |  no   |    no     |
+ *
+ *  `*` only when the row's TOKEN matches the one this tab recorded from its own
+ *  POST. The mint table is keyed by slug, so a second tab connecting the same
+ *  provider replaces the row; without the token check this tab would read the
+ *  sibling's expiry and uninstall the entry the sibling just installed. On a
+ *  mismatch the wait still clears — this tab's own attempt is over — but nothing
+ *  that mutates the entry fires, and the live row governs what renders.
+ *
+ *  Three rows carry the reasoning:
+ *  - `granted` must PROBE. The card's cached status predates consent, so without
+ *    a fresh read it keeps showing the pre-consent error after authorization
+ *    succeeded.
+ *  - `expired` + new-this-flow + token match must UNINSTALL. This flow installed
+ *    the entry moments ago and no grant followed, so leaving it puts the card on
+ *    "Needs attention" instead of the idle Connect the expiry promises. Only an
+ *    entry this flow created is ever removed — a pre-existing one is the user's.
+ *  - `failed` keeps the entry on purpose. Something went wrong rather than timed
+ *    out, so the error surface plus a retryable entry beats silently undoing the
+ *    install.
+ */
+export type MintOutcome = {
+  clearWait: boolean
+  probe: boolean
+  error: boolean
+  uninstall: boolean
+}
+
+const MINT_WAIT_HELD: MintOutcome = {
+  clearWait: false, probe: false, error: false, uninstall: false,
+}
+
+/** True when the feed row is the one THIS tab's connect started. */
+function mintRowIsOurs(
+  mint: ConnectionMintState | undefined,
+  pending: PendingConnect | undefined,
+): boolean {
+  return !!mint?.token && !!pending?.token && mint.token === pending.token
+}
+
+export function mintOutcome(
+  mint: ConnectionMintState | undefined,
+  pending: PendingConnect | undefined,
+): MintOutcome {
+  switch (mint?.state) {
+    case 'granted':
+      return { clearWait: true, probe: true, error: false, uninstall: false }
+    case 'failed':
+      return { clearWait: true, probe: false, error: true, uninstall: false }
+    case 'expired':
+      return {
+        clearWait: true,
+        probe: false,
+        error: false,
+        uninstall: uninstallOnCancel(pending) && mintRowIsOurs(mint, pending),
+      }
+    default:
+      return MINT_WAIT_HELD
+  }
+}
+
+
+export function withMintedUrl(
+  oauth: OAuthState | undefined,
+  mint: ConnectionMintState | undefined,
+): OAuthState | undefined {
+  const minted = mint?.state === 'waiting' ? (mint.oauth_url || '') : ''
+  if (!minted || oauth?.oauthUrl) return oauth
+  return {
+    completed: false,
+    failed: false,
+    error: '',
+    timestamp: 0,
+    ...(oauth ?? {}),
+    oauthUrl: minted,
+    minted: true,
+  }
 }
 
 /** Only a cancelled *new* connect uninstalls the entry it just created;
@@ -290,7 +405,13 @@ function ConnectionCard({
         {state === 'waiting-for-approval' && (
           <div className="space-y-3">
             <div className="text-[13px] font-medium text-text-strong">
-              {t('pages.connectionsPage.finish_approving_in_browser')}
+              {/* A minted URL opened no tab, so "finish approving in your browser"
+                  would point the user at a window that does not exist. Existing
+                  keys only -- the fuller copy rewrite needs a 14-locale pass and
+                  rides with the connections-copy slice. */}
+              {t(oauth?.minted
+                ? 'pages.connectionsPage.waiting_for_approval'
+                : 'pages.connectionsPage.finish_approving_in_browser')}
             </div>
             <div className="flex flex-wrap items-center gap-2">
               {approvalUrl ? (
@@ -461,24 +582,96 @@ export default function ConnectionsPage({ servicesEnabled = false }: { servicesE
     refetchInterval: activeTab === 'services' && Object.values(locallyWaiting).some(Boolean) ? 5_000 : false,
   })
 
+  // Minted approval URLs, keyed by slug. Fetched only while a connect is pending:
+  // outside that window nothing is minting and the endpoint would answer `idle`.
+  const waitingSlugs = useMemo(
+    () => Object.keys(locallyWaiting).sort(),
+    [locallyWaiting],
+  )
+  const { data: mintByServer = {} } = useQuery<Record<string, ConnectionMintState>>({
+    queryKey: ['connections-mint', waitingSlugs],
+    queryFn: async () => {
+      const states = await Promise.all(
+        waitingSlugs.map(slug => api.connectionsMintState(slug).catch(() => undefined)),
+      )
+      const next: Record<string, ConnectionMintState> = {}
+      for (const state of states) if (state) next[state.slug] = state
+      return next
+    },
+    enabled: waitingSlugs.length > 0,
+    refetchInterval: MINT_POLL_MS,
+    // A mint row is only valid for the attempt that produced it. Cached across an
+    // inactive window it would be replayed on the next Connect for the same
+    // provider, flashing a previous attempt's URL that no listener can redeem.
+    gcTime: 0,
+  })
+
   useEffect(() => {
-    setLocallyWaiting(current => {
-      let changed = false
-      const next = { ...current }
-      for (const provider of CONNECTION_PROVIDERS) {
-        const pending = current[provider.slug]
-        if (!pending) continue
-        const server = serverForConnection(provider, servers)
-        const oauth = oauthByServer[provider.slug]
-        const fresh = effectiveOAuth(oauth, pending)
-        if (server?.status === 'ok' || fresh?.completed || fresh?.failed) {
-          delete next[provider.slug]
-          changed = true
-        }
+    // Decided BEFORE any setState: a state updater runs on a later render, so
+    // collecting side-effect targets inside one leaves them empty at read time.
+    const cleared: string[] = []
+    const failedMints: string[] = []
+    const grantedMints: string[] = []
+    const uninstallTargets: { slug: string; token: number }[] = []
+    for (const provider of CONNECTION_PROVIDERS) {
+      const pending = locallyWaiting[provider.slug]
+      if (!pending) continue
+      const server = serverForConnection(provider, servers)
+      const fresh = effectiveOAuth(oauthByServer[provider.slug], pending)
+      const outcome = mintOutcome(mintByServer[provider.slug], pending)
+      if (!(server?.status === 'ok' || fresh?.completed || fresh?.failed || outcome.clearWait)) {
+        continue
       }
-      return changed ? next : current
+      cleared.push(provider.slug)
+      if (outcome.error) failedMints.push(provider.slug)
+      if (outcome.probe) grantedMints.push(provider.slug)
+      if (outcome.uninstall && server && pending.token) {
+        uninstallTargets.push({ slug: provider.slug, token: pending.token })
+      }
+    }
+    if (!cleared.length) return
+
+    setLocallyWaiting(current => {
+      const next = { ...current }
+      for (const slug of cleared) delete next[slug]
+      return next
     })
-  }, [servers, oauthByServer])
+    if (grantedMints.length) {
+      // The cached status predates consent, so without a fresh read the card
+      // keeps showing its pre-consent error after authorization succeeded.
+      void api.mcpProbe().then(probed => {
+        queryClient.setQueryData<McpServer[]>(['mcp-servers'], probed as McpServer[])
+      }).catch(() => undefined)
+    }
+    for (const target of uninstallTargets) {
+      // The entry this flow installed, with no grant behind it, would otherwise
+      // leave the card on "Needs attention" instead of the idle Connect expiry
+      // promises. The token goes with the request: the server re-checks it against
+      // the live row under its own lock, so a sibling tab that superseded this
+      // attempt in the meantime keeps its entry. The client check above is only a
+      // fast path.
+      void api.connectionsMintAbandon(target.slug, target.token)
+        .then(() => queryClient.invalidateQueries({ queryKey: ['mcp-servers'] }))
+        .catch(() => undefined)
+    }
+    if (failedMints.length) {
+      setFeedback(current => {
+        const next = { ...current }
+        for (const slug of failedMints) {
+          // Existing strings only. The mint's reason is a coarse machine code and
+          // is deliberately not shown; the dedicated copy lands with the
+          // connections-copy slice, which carries the 14-locale pass.
+          next[slug] = {
+            kind: 'error',
+            text: t('pages.connectionsPage.action_failed', {
+              error: t('pages.connectionsPage.unknown_error'),
+            }),
+          }
+        }
+        return next
+      })
+    }
+  }, [servers, oauthByServer, mintByServer, locallyWaiting, queryClient, t])
 
   const filteredProviders = useMemo(() => {
     // Held feature: offer nothing. No card renders, so no Connect button and no
@@ -550,10 +743,23 @@ export default function ConnectionsPage({ servicesEnabled = false }: { servicesE
     } else {
       await api.mcpCustomAdd({ [provider.slug]: { url: provider.mcp_url } }, true)
     }
-    setLocallyWaiting(current => ({ ...current, [provider.slug]: { kind: existing ? 'reconnect' : 'new', sinceTs } }))
+    // Ask for the approval URL rather than waiting for one, and await it: a
+    // rejected POST must reach `run`'s error path instead of leaving the card in
+    // a waiting state no mint will ever answer. Ordered after the entry write
+    // because the mint activates a one-server spec derived from it. The response
+    // names the row THIS tab started, so a sibling tab's terminal state cannot be
+    // mistaken for ours.
+    const started = await api.connectionsMint(provider.slug)
+    setLocallyWaiting(current => ({
+      ...current,
+      [provider.slug]: {
+        kind: existing ? 'reconnect' : 'new',
+        sinceTs,
+        token: started?.token,
+      },
+    }))
     // Kick a real status probe so the card reflects the new entry instead of
-    // dead-ending on the cached /api/mcp read; the authorization itself (and
-    // its approval URL) is produced by the runtime on the next agent turn.
+    // dead-ending on the cached /api/mcp read.
     void api.mcpProbe().then(probed => {
       queryClient.setQueryData<McpServer[]>(['mcp-servers'], probed as McpServer[])
     }).catch(() => undefined)
@@ -684,7 +890,10 @@ export default function ConnectionsPage({ servicesEnabled = false }: { servicesE
               {filteredProviders.map(provider => {
                 const server = serverForConnection(provider, servers)
                 const pending = locallyWaiting[provider.slug]
-                const oauth = effectiveOAuth(oauthByServer[provider.slug], pending)
+                const oauth = withMintedUrl(
+                  effectiveOAuth(oauthByServer[provider.slug], pending),
+                  mintByServer[provider.slug],
+                )
                 const state = connectionStateFor(server, oauth, !!pending)
                 const cardBusy = busy?.slug === provider.slug ? busy.action : undefined
                 return (

@@ -6,8 +6,11 @@ import {
   effectiveOAuth,
   isValidLoopbackReturnAddress,
   latestOAuthByServer,
+  mintOutcome,
   uninstallOnCancel,
+  withMintedUrl,
   type OAuthState,
+  type PendingConnect,
 } from '../pages/connections/ConnectionsPage'
 
 const server = (status: string): McpServer => ({
@@ -78,6 +81,140 @@ describe('card-owned OAuth messages feed the card', () => {
     expect(feed.notion.oauthUrl).toBe('https://mcp.notion.com/authorize?state=x')
   })
 })
+
+/**
+ * A minted URL is the feed for a card-initiated connect, and it is folded in
+ * AFTER the banner staleness fence — a mint belongs to the click being served,
+ * so it must never be discarded as a leftover from a prior attempt.
+ */
+describe('mint outcome table', () => {
+  const newFlow: PendingConnect = { kind: 'new', sinceTs: 0 }
+  const preExisting: PendingConnect = { kind: 'reconnect', sinceTs: 0 }
+  const held = { clearWait: false, probe: false, error: false, uninstall: false }
+
+  it.each([undefined, 'idle', 'minting', 'waiting'] as const)(
+    'holds the wait for %s',
+    state => {
+      const row = state === undefined ? undefined : { slug: 'notion', state }
+      expect(mintOutcome(row, newFlow)).toEqual(held)
+      expect(mintOutcome(row, preExisting)).toEqual(held)
+    },
+  )
+
+  it('probes on granted so the pre-consent error is replaced', () => {
+    for (const pending of [newFlow, preExisting]) {
+      expect(mintOutcome({ slug: 'notion', state: 'granted' }, pending)).toEqual({
+        clearWait: true, probe: true, error: false, uninstall: false,
+      })
+    }
+  })
+
+  it('surfaces an error on failed and keeps the entry for a retry', () => {
+    for (const pending of [newFlow, preExisting]) {
+      expect(mintOutcome({ slug: 'notion', state: 'failed' }, pending)).toEqual({
+        clearWait: true, probe: false, error: true, uninstall: false,
+      })
+    }
+  })
+
+  it('uninstalls on expired when THIS flow installed the entry', () => {
+    // Otherwise the card lands on "Needs attention" instead of idle Connect.
+    expect(mintOutcome({ slug: 'notion', state: 'expired', token: 7 }, { ...newFlow, token: 7 }))
+      .toEqual({ clearWait: true, probe: false, error: false, uninstall: true })
+  })
+
+  it('does NOT uninstall when the expired row belongs to another tab', () => {
+    // Two tabs, one slug-keyed row: Tab B superseded Tab A, so B's expiry must not
+    // remove the entry A installed. The wait still clears -- this attempt is over.
+    expect(mintOutcome({ slug: 'notion', state: 'expired', token: 9 }, { ...newFlow, token: 7 }))
+      .toEqual({ clearWait: true, probe: false, error: false, uninstall: false })
+  })
+
+  it('does NOT uninstall when either side has no token', () => {
+    expect(mintOutcome({ slug: 'notion', state: 'expired' }, { ...newFlow, token: 7 }).uninstall)
+      .toBe(false)
+    expect(mintOutcome({ slug: 'notion', state: 'expired', token: 7 }, newFlow).uninstall)
+      .toBe(false)
+  })
+
+  it('never uninstalls a pre-existing entry, or one of unknown origin', () => {
+    const row = { slug: 'notion', state: 'expired' as const, token: 7 }
+    expect(mintOutcome(row, { ...preExisting, token: 7 }).uninstall).toBe(false)
+    expect(mintOutcome(row, undefined).uninstall).toBe(false)
+  })
+
+})
+
+describe('minted approval URLs', () => {
+  const minted = 'https://mcp.notion.com/authorize?state=minted'
+
+  it('supplies the URL when no banner has arrived', () => {
+    const merged = withMintedUrl(undefined, { slug: 'notion', state: 'waiting', oauth_url: minted })
+    expect(merged?.oauthUrl).toBe(minted)
+    expect(connectionStateFor(server('unknown'), merged)).toBe('waiting-for-approval')
+  })
+
+  it('survives the staleness fence that discards a stale banner', () => {
+    const stale: OAuthState = {
+      completed: false, failed: false, oauthUrl: 'https://old.example/authorize', error: '', timestamp: 5,
+    }
+    const fenced = effectiveOAuth(stale, { kind: 'new', sinceTs: 10 })
+    expect(fenced).toBeUndefined()
+    expect(withMintedUrl(fenced, { slug: 'notion', state: 'waiting', oauth_url: minted })?.oauthUrl)
+      .toBe(minted)
+  })
+
+  it('leaves an existing banner URL in place', () => {
+    const banner: OAuthState = {
+      completed: false, failed: false, oauthUrl: 'https://banner.example/authorize', error: '', timestamp: 1,
+    }
+    expect(withMintedUrl(banner, { slug: 'notion', state: 'waiting', oauth_url: minted })?.oauthUrl)
+      .toBe('https://banner.example/authorize')
+  })
+
+  it('preserves a terminal banner verdict while filling in the URL', () => {
+    const failed: OAuthState = {
+      completed: false, failed: true, oauthUrl: '', error: 'denied', timestamp: 1,
+    }
+    const merged = withMintedUrl(failed, { slug: 'notion', state: 'waiting', oauth_url: minted })
+    expect(merged?.failed).toBe(true)
+    expect(merged?.error).toBe('denied')
+  })
+
+  it.each(['idle', 'minting', 'granted', 'failed', 'expired'] as const)(
+    'offers no URL in the %s state',
+    state => {
+      // Only `waiting` holds a redeemable URL; `expired` in particular carries
+      // one the backend has already judged unredeemable.
+      expect(withMintedUrl(undefined, { slug: 'notion', state, oauth_url: minted })).toBeUndefined()
+    },
+  )
+
+  it('is a no-op when no mint exists', () => {
+    expect(withMintedUrl(undefined, undefined)).toBeUndefined()
+  })
+
+  it('marks a minted URL so the card can drop the browser-tab copy', () => {
+    // The mint opens no tab, so "finish approving in your browser" would send the
+    // user looking for a window that never existed.
+    const merged = withMintedUrl(undefined, { slug: 'notion', state: 'waiting', oauth_url: minted })
+    expect(merged?.minted).toBe(true)
+  })
+
+  it('leaves a banner-sourced URL unmarked', () => {
+    const banner: OAuthState = {
+      completed: false, failed: false, oauthUrl: 'https://banner.example/authorize', error: '', timestamp: 1,
+    }
+    expect(withMintedUrl(banner, { slug: 'notion', state: 'waiting', oauth_url: minted })?.minted)
+      .toBeUndefined()
+  })
+})
+
+/**
+ * A mint that ends without a URL must end the wait too. Consuming only `waiting`
+ * left the card spinning forever on a failed or TTL-expired mint, with the poll
+ * still running and copy telling the user to do something that cannot help.
+ */
 
 describe('stale OAuth banner fencing', () => {
   const banner = (timestamp: number, completed = true): OAuthState => ({
