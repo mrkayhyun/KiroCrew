@@ -241,6 +241,9 @@ _BULLET_RE = re.compile(r"^(\s*)[-*+]\s+", re.MULTILINE)
 # Characters a GFM separator row may contain (`| --- |`, `|:---|---:|`, `- | -`).
 _TABLE_SEP_CHARS = set("-:| \t")
 
+#: A cell boundary inside a table row. `\|` is escaped content, not a boundary.
+_CELL_PIPE_RE = re.compile(r"(?<!\\)\|")
+
 
 #: A line that opens or closes a fenced code block.
 _FENCE_LINE_RE = re.compile(r"^[ \t]*(?:`{3,}|~{3,})", re.MULTILINE)
@@ -254,17 +257,119 @@ def _is_table_separator(line: str) -> bool:
     return "-" in stripped and "|" in stripped
 
 
+def _row_cell_count(row: str) -> int:
+    """Number of cells in a GFM table row.
+
+    Outer pipes are optional, so one leading and one trailing pipe are dropped
+    before splitting. An escaped ``\\|`` is cell content, not a boundary.
+    """
+    stripped = row.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|") and not stripped.endswith("\\|"):
+        stripped = stripped[:-1]
+    return len(_CELL_PIPE_RE.split(stripped))
+
+
+def _header_cut(line: str, want: int) -> int | None:
+    """Offset where *line*'s leading prose ends and a *want*-cell row begins.
+
+    Only the FIRST pipe is a candidate. A later boundary would slice the table's
+    own header in half, and a header that is merely short by cells is a malformed
+    table rather than prose -- that case belongs in the monospace fallback,
+    untouched. ``None`` means leave the line alone.
+    """
+    match = _CELL_PIPE_RE.search(line)
+    if match is None or match.start() == 0:
+        return None
+    head, row = line[: match.start()], line[match.start() :]
+    if head.strip() and _row_cell_count(row) == want:
+        return match.start()
+    return None
+
+
+#: A line indented far enough to be an indented code block, where GFM allows a
+#: table row at most 3 leading spaces.
+_INDENTED_CODE_RE = re.compile(r"^(?: {4,}|\t)")
+
+
+def _table_body_widths(lines: list[str], start: int) -> list[int]:
+    """Cell counts of the contiguous body rows beginning at *start*."""
+    widths: list[int] = []
+    i = start
+    while i < len(lines) and "|" in lines[i]:
+        widths.append(_row_cell_count(lines[i]))
+        i += 1
+    return widths
+
+
+def _unglue_table_header(text: str) -> str:
+    """Break a line that runs prose straight into a table's header row.
+
+    GFM recognizes a table only when the header and delimiter rows carry the
+    SAME number of cells, so ``prose | a | b |`` above ``| --- | --- |`` is three
+    cells against two and parses as a paragraph -- and paragraph rendering
+    collapses newlines, so the whole table then ships as one flattened run of
+    literal pipes. Inserting the missing break recovers a real table.
+
+    A wide header alone cannot tell a prose prefix apart from a MALFORMED table
+    (``Name | Age | City`` over a two-column delimiter is also one cell wide).
+    The body rows are the evidence: cutting is allowed only when at least one
+    body row exists and every one of them is exactly the delimiter's width, so
+    the leading prose is the only anomaly. Without that agreement the cut would
+    demote a genuine header cell to prose AND lose data, because GFM drops the
+    body cells that overflow the delimiter's width -- so such text is left for
+    the monospace fallback, which shows every row verbatim.
+
+    Code is never rewritten, in either of the two forms that carry it. Text
+    holding ANY fence is returned untouched, and a row indented enough to be an
+    indented code block is skipped -- the cut lands after that indentation, so
+    the row would leave the code block and Telegram would show a sample the user
+    never wrote. Fences are screened whole rather than located, because deciding
+    where one begins means reimplementing CommonMark's fence rules as a second
+    parser beside the one the HTML renderer owns.
+    """
+    if "|" not in text or _FENCE_LINE_RE.search(text):
+        return text
+    lines = text.split("\n")
+    out: list[str] = []
+    for i, line in enumerate(lines):
+        sep = lines[i + 1] if i + 1 < len(lines) else ""
+        indented = _INDENTED_CODE_RE.match(line) or _INDENTED_CODE_RE.match(sep)
+        if not indented and "|" in line and _is_table_separator(sep):
+            want = _row_cell_count(sep)
+            body = _table_body_widths(lines, i + 2)
+            cut = (
+                _header_cut(line, want)
+                if body and all(w == want for w in body) and _row_cell_count(line) > want
+                else None
+            )
+            if cut is not None:
+                out.append(line[:cut].rstrip())
+                out.append("")
+                line = line[cut:]
+        out.append(line)
+    return "\n".join(out)
+
+
 def _has_table(text: str) -> bool:
     """True if *text* contains a GFM pipe table.
 
-    A table is a line holding at least one ``|`` immediately followed by a
-    separator row. Outer pipes are optional on BOTH rows, because GFM accepts
-    ``a | b`` / ``--- | ---`` with no leading or trailing pipe -- anchoring on a
-    leading ``|`` silently missed those and rendered them as literal pipes.
+    A table is a pipe-bearing line immediately followed by a separator row whose
+    cell count MATCHES it. The count check is what GFM (and therefore Telegram's
+    Rich Markdown) uses to decide a table exists at all, so skipping it sends
+    content down the rich path that the server then renders as a plain paragraph
+    -- newlines collapsed, pipes literal, worse than the monospace fallback.
+
+    Outer pipes are optional on BOTH rows, because GFM accepts ``a | b`` /
+    ``--- | ---`` with no leading or trailing pipe -- anchoring on a leading
+    ``|`` silently missed those and rendered them as literal pipes.
 
     The separator row must contain a dash (so it is a separator, not more data)
     and a pipe (so a bare ``-----`` horizontal rule under a pipe-bearing
-    sentence is not mistaken for a table).
+    sentence is not mistaken for a table). The header must contain a pipe for
+    the same reason: a one-cell separator would otherwise promote any ordinary
+    sentence above it to a table.
 
     Deliberately does NOT exclude fenced code blocks. Table markup inside a
     fence only means one extra rich send, not wrong output: Rich Markdown parses
@@ -276,7 +381,10 @@ def _has_table(text: str) -> bool:
     """
     lines = text.split("\n")
     return any(
-        "|" in header and _is_table_separator(sep) for header, sep in zip(lines, lines[1:])
+        "|" in header
+        and _is_table_separator(sep)
+        and _row_cell_count(header) == _row_cell_count(sep)
+        for header, sep in zip(lines, lines[1:])
     )
 
 
@@ -753,6 +861,12 @@ class TelegramRenderer(Renderer):
             if keyboard is None:
                 return
             text = "…"
+
+        # A header row glued to leading prose is not a table to any GFM parser,
+        # so restore the break before the transport is chosen -- otherwise the
+        # rich path renders the whole block as one flattened paragraph. Applied
+        # to every path, so the monospace and HTML seals see the same shape.
+        text = _unglue_table_header(text)
 
         # --- Rich Message path: tables detected → sendRichMessage (Bot API 10.1+) ---
         # Rich Markdown renders pipe tables natively; the legacy HTML subset

@@ -62,6 +62,7 @@ from kiro_crew.telegram.renderer import (
     _split_markdown_bounded,
     _split_text,
     _strip_steering,
+    _unglue_table_header,
     build_inline_keyboard,
 )
 from kiro_crew.telegram.transport import (
@@ -1167,6 +1168,95 @@ class TestRenderer:
         # A pipe-bearing sentence above a horizontal rule is NOT a table: the
         # separator row has no pipe, so it stays on the ordinary HTML path.
         assert not _has_table("cost | benefit analysis\n---------------------")
+
+    def test_table_detection_requires_matching_cell_counts(self) -> None:
+        # THE bug: a header row glued to leading prose has one cell too many, so
+        # no GFM parser sees a table. Claiming one anyway sends the block down
+        # the rich path, where the server renders it as a single paragraph --
+        # newlines collapsed, every pipe literal. Counting cells is what keeps
+        # that content on the monospace path instead.
+        assert not _has_table("Here you go:| a | b |\n| --- | --- |\n| 1 | 2 |")
+        assert not _has_table("a | b | c\n--- | ---\n1 | 2")  # malformed, 3 vs 2
+        assert _has_table("| a |\n| --- |\n| 1 |")  # single column is still a table
+        assert _has_table("| a\\|b | c |\n| --- | --- |\n| 1 | 2 |")  # escaped pipe
+        # A one-cell separator must not promote the sentence above it to a table.
+        assert not _has_table("just prose\n|---|")
+
+    def test_a_glued_table_header_is_unglued_so_the_table_survives(self) -> None:
+        # Recovery, not just refusal: restoring the break the reply is missing
+        # turns the same content into a table the server can actually parse.
+        out = _unglue_table_header("Here you go:| a | b |\n| --- | --- |\n| 1 | 2 |")
+        assert out == "Here you go:\n\n| a | b |\n| --- | --- |\n| 1 | 2 |"
+        assert _has_table(out)
+
+    def test_ungluing_leaves_an_ambiguous_or_malformed_header_alone(self) -> None:
+        # Only the FIRST pipe is a split candidate, so a header that is short by
+        # cells (a malformed table, not prose) is never sliced in half -- it goes
+        # to the monospace fallback unchanged.
+        malformed = "a | b | c | d\n| --- | --- |\n| 1 | 2 |"
+        assert _unglue_table_header(malformed) == malformed
+        # Nothing to unglue when the counts already agree.
+        good = "| a | b |\n| --- | --- |\n| 1 | 2 |"
+        assert _unglue_table_header(good) == good
+
+    def test_a_malformed_table_is_never_rewritten_into_prose(self) -> None:
+        # A header exactly ONE cell wider than its delimiter is indistinguishable
+        # from prose by width alone, so the body rows decide. Here they are three
+        # cells against a two-cell delimiter, which means the DELIMITER is wrong
+        # and the first header cell is real: cutting would demote `Name` to prose
+        # and GFM would additionally drop the overflowing body cell. Left intact
+        # for the monospace fallback, which shows every row verbatim.
+        malformed = "Name | Age | City\n| --- | --- |\n| a | b | c |"
+        assert _unglue_table_header(malformed) == malformed
+        assert not _has_table(malformed), "and it must not claim the rich path"
+
+    def test_ungluing_needs_a_body_row_to_corroborate_the_width(self) -> None:
+        # Header + delimiter with no body row leaves nothing to confirm which of
+        # the two rows is wrong, so the cut is declined rather than guessed.
+        bare = "Here you go:| a | b |\n| --- | --- |"
+        assert _unglue_table_header(bare) == bare
+
+    def test_ungluing_never_rewrites_a_fenced_code_sample(self) -> None:
+        # Injecting a newline inside a fence would rewrite the code the user
+        # asked to see, so any fenced text is returned byte-identical.
+        fenced = "```md\nprose| a | b |\n| --- | --- |\n```"
+        assert _unglue_table_header(fenced) == fenced
+
+    def test_ungluing_never_rewrites_an_indented_code_sample(self) -> None:
+        # An indented code block is the second way markdown carries code, and it
+        # has no fence to screen on. The cut lands after the indentation, so
+        # ungluing here would pull the header row out of the code block and show
+        # the user a sample they never wrote. GFM allows a table row at most 3
+        # leading spaces, so 4+ (or a tab) is code and is skipped.
+        indented = "    prose | a | b |\n    | --- | --- |\n    | 1 | 2 |"
+        assert _unglue_table_header(indented) == indented
+        tabbed = "\tprose | a | b |\n\t| --- | --- |\n\t| 1 | 2 |"
+        assert _unglue_table_header(tabbed) == tabbed
+        # Up to 3 spaces is still a table, so it is still unglued.
+        assert _unglue_table_header("  p | a | b |\n  | --- | --- |\n  | 1 | 2 |") != (
+            "  p | a | b |\n  | --- | --- |\n  | 1 | 2 |"
+        )
+
+    def test_a_glued_table_reply_still_reaches_telegram_as_a_table(self) -> None:
+        # End to end through the seal: the reply that shipped as flattened pipes
+        # must now leave as markdown whose header row starts its own line, which
+        # is the only form the server renders as a table.
+        glued = "Here is the table you asked for:| a | b |\n| --- | --- |\n| 1 | 2 |"
+        cli = FakeClient()
+        r = TelegramRenderer(cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0")  # type: ignore[arg-type]
+
+        async def _go() -> None:
+            await r.on_turn_start()
+            await r.on_text_chunk(glued)
+            await r._stream_live(force=True)
+            await r._seal_current()
+
+        asyncio.run(_go())
+
+        assert len(cli.rich_sent) == 1, "the table must still take the rich path"
+        sent = cli.rich_sent[0][0]
+        assert "for:\n\n| a | b |" in sent, "the header row must start its own line"
+        assert _has_table(sent), "what we send has to parse as a table"
 
     def test_a_degraded_table_is_sealed_monospace_not_as_ragged_pipes(self) -> None:
         # When rich is unavailable the table still has to go out, but sealing it
