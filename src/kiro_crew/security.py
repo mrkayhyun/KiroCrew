@@ -4565,6 +4565,48 @@ def _build_sensitive_regex() -> re.Pattern[str]:
         # ``marker.exists()``) is caught, not just the exact-leaf forms.
         rf"{home_alts}/(?:{wp_prefixes})/(?:{wp_leaves})(?:/|\s|$|['\"])"
     )
+    # Perpetual agents' LIFE.md: agents/<generated id>/LIFE.md — the id
+    # segment is dynamic, so this cannot live in the literal leaf list. Named
+    # verb-independently like the leaves above: writing one's own goal file
+    # is the self-modification the RFC hard-refuses (§6/Non-goals), and reads
+    # via bash are harmless (the prompt already carries the content).
+    #
+    # GPT round-6 hardening, both in this one branch:
+    #  * every separator is the POSIX ``gsep`` below (mirroring ``win_gsep``),
+    #    so canonical no-op spellings — ``agents/<id>/./LIFE.md``,
+    #    ``agents/x/../x/LIFE.md``, ``~/.kiro/./crew/...`` — still match;
+    #  * when ``KIROCREW_HOME`` re-anchors the data home, the live agents dir
+    #    is ``$KIROCREW_HOME/agents`` and carries NO home-anchored spelling,
+    #    so the resolved env root is added as an extra literal anchor (both
+    #    the expanded and realpath forms, matching the keystone-leaf duality
+    #    in ``_home_dir_targets_uncached``). The regex is process-cached, and
+    #    ``KIROCREW_HOME`` is fixed at process start, so build-time capture
+    #    is sound; tests that churn the env call ``_build_sensitive_regex``
+    #    directly, as the existing gate tests do.
+    gsep = r"(?:/(?:\.|[^/\s'\"]{1,64}/\.\.))*/"
+    # Separator-agnostic gsep for literal env-root forms: on a Windows host
+    # ``KIROCREW_HOME`` (and its realpath) is spelled with backslashes, so the
+    # env anchors must accept either separator plus the same no-op chains.
+    gsep_any = r"(?:[\\/](?:\.|[^\\/\s'\"]{1,64}[\\/]\.\.))*[\\/]"
+    wp_prefixes_g = "|".join(re.escape(p).replace("/", gsep) for p in _CREW_HOME_PREFIXES)
+    life_anchor_alts = [rf"{home_alts}{gsep}(?:{wp_prefixes_g})"]
+    _crew_env = os.environ.get("KIROCREW_HOME")
+    if _crew_env:
+        _env_forms = {os.path.abspath(os.path.expanduser(_crew_env))}
+        try:
+            _env_forms.add(os.path.realpath(os.path.expanduser(_crew_env)))
+        except (OSError, ValueError):
+            pass
+        for _form in sorted(_env_forms):
+            _parts = [p for p in re.split(r"[\\/]+", _form) if p]
+            _anchor = gsep_any.join(re.escape(p) for p in _parts)
+            if _form.startswith(("/", "\\")):
+                _anchor = gsep_any + _anchor
+            life_anchor_alts.append(_anchor)
+    agent_life_path = (
+        rf"(?:{'|'.join(life_anchor_alts)})"
+        rf"{gsep}agents{gsep}[^/\s'\"]+{gsep}LIFE\.md(?:\s|$|['\"])"
+    )
     # Windows-native spellings of the same fenced dirs, matched in the RAW
     # command text. POSIX shlex consumes unquoted backslashes during
     # tokenization, and an embedded interpreter script
@@ -4639,6 +4681,37 @@ def _build_sensitive_regex() -> re.Pattern[str]:
         rf"{appdata_var}(?:{win_sep}\.\.{win_sep}Roaming)*"
         rf"{win_gsep}(?:{appdata_remainders})(?:{win_sep}|\s|$|['\"])"
     )
+    # GPT round-7 (BLOCKING): two spellings the round-6 branch still missed.
+    #
+    # (a) Windows-native direct spelling of the goal file — the POSIX branch
+    # above cannot see backslash separators or %USERPROFILE% anchors, exactly
+    # the gap ``win_sensitive_path`` closes for the fenced dirs. Same anchors,
+    # same ``win_gsep`` no-op chains, same crew prefixes.
+    crew_prefixes_win = "|".join(
+        win_gsep.join(re.escape(part) for part in p.split("/"))
+        for p in _CREW_HOME_PREFIXES
+    )
+    win_agent_life_path = (
+        rf"{win_home_alts}{win_gsep}(?:{crew_prefixes_win})"
+        rf"{win_gsep}agents{win_gsep}[^\\/\s'\"]+{win_gsep}LIFE\.md(?:\s|$|['\"])"
+    )
+    # (b) CHAINED RELATIVE writes: ``cd <crew agents dir> && echo x > LIFE.md``
+    # names the goal file only as a bare relative token, so no path-anchored
+    # branch can bind the two together. Conjunction via two whole-command
+    # lookaheads, anchored at ``^`` so the scan runs once: the command names
+    # a crew agents directory (any anchor family — POSIX home, env root,
+    # Windows-native) AND mentions ``LIFE.md`` anywhere. Naming both is the
+    # signal; a read over-matched by this branch is harmless (posture pinned
+    # above), and ``JOURNAL.md`` work in the same directory never mentions
+    # LIFE.md, so it stays allowed.
+    agents_dir_any = (
+        rf"(?:{'|'.join(life_anchor_alts)}){gsep}agents(?:/|\s|$|['\"])"
+        rf"|{win_home_alts}{win_gsep}(?:{crew_prefixes_win})"
+        rf"{win_gsep}agents(?:{win_sep}|\s|$|['\"])"
+    )
+    agent_life_chain = (
+        rf"^(?=[\s\S]*(?:{agents_dir_any}))(?=[\s\S]*LIFE\.md)"
+    )
     return re.compile(
         # (1) verb/redirect-anchored, OR (2) verb-independent: the sensitive path
         # appears anywhere as a token.  The token anchor accepts start-of-string
@@ -4654,6 +4727,9 @@ def _build_sensitive_regex() -> re.Pattern[str]:
         rf"{sensitive_path}"
         rf"|(?:^|.*[\s'\"=:,;]){sensitive_path}"
         rf"|(?:^|.*[\s'\"=:,;]){write_protected_path}"
+        rf"|(?:^|.*[\s'\"=:,;]){agent_life_path}"
+        rf"|(?:^|.*[\s'\"=:,;]){win_agent_life_path}"
+        rf"|{agent_life_chain}"
         # (4) Windows-native spelling, verb-independent (same token anchor):
         # covers quoted backslash paths AND embedded-script literals that the
         # tokenizing passes cannot see. (5) the %APPDATA% alias of the fenced
@@ -4999,9 +5075,56 @@ def is_sensitive_write_path(path_str: str, base_dir: str | None = None) -> bool:
     (``hooks.on_tool_call`` on the ACP ``edit`` kind) — see
     :data:`_WRITE_PROTECTED_HOME_PATHS` for the rationale.
     """
+    if _is_agent_life_md(path_str, base_dir):
+        return True
     return _path_in_home_dirs(
         path_str, _SENSITIVE_HOME_DIRS + _WRITE_PROTECTED_HOME_PATHS, base_dir
     )
+
+
+def _is_agent_life_md(path_str: str, base_dir: str | None = None) -> bool:
+    """True when the path is a perpetual agent's ``LIFE.md``.
+
+    ``agents/<id>/LIFE.md`` under any crew home prefix is the agent's GOAL
+    file — §6 of the perpetual-agent RFC: owner is the human, the agent may
+    read it every wake and may never write it. An auto-approved perpetual
+    agent that could rewrite its own LIFE.md would self-modify its goal and
+    boundaries and ingest them on the very next wake. The middle segment is
+    the generated job id, so this cannot be expressed as a literal entry in
+    :data:`_WRITE_PROTECTED_HOME_PATHS`; the shape check lives here instead.
+    Reads stay allowed (the whole point of the file), and JOURNAL.md in the
+    same directory stays agent-writable.
+    """
+    try:
+        raw = Path(path_str).expanduser()
+        if not raw.is_absolute() and base_dir:
+            raw = Path(base_dir) / raw
+        resolved = Path(os.path.realpath(raw))
+    except (OSError, ValueError):
+        return True  # unresolvable path aimed at a guarded name: fail closed
+    if resolved.name != "LIFE.md":
+        return False
+    parent = resolved.parent
+    agents_roots = [Path.home() / prefix / "agents" for prefix in _CREW_HOME_PREFIXES]
+    # GPT round-6: when KIROCREW_HOME re-anchors the data home, the live
+    # agents directory is ``$KIROCREW_HOME/agents`` — NOT under either
+    # default crew prefix. Without this anchor both guards permit a write to
+    # the real goal file whenever the env override is set (the same gap the
+    # keystone leaves close in ``_home_dir_targets_uncached``). The default
+    # ``~``-rooted forms stay, so every location is always covered.
+    crew_env = os.environ.get("KIROCREW_HOME")
+    if crew_env:
+        try:
+            agents_roots.append(Path(crew_env).expanduser() / "agents")
+        except (OSError, ValueError):
+            pass
+    for root in agents_roots:
+        try:
+            if parent.parent == Path(os.path.realpath(root)):
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
 
 
 def sensitive_home_dirs() -> tuple[str, ...]:

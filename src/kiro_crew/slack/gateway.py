@@ -2237,7 +2237,10 @@ class GatewayOrchestrator:
             _prompt_dispatched = False
             # helper picks stable vs ephemeral session key and
             # decides whether to prepend last_result, based on job.persistent_session.
-            session_key, msg = build_cron_session_context(job)
+            # Offloaded: for kind="self" jobs the context assembly reads the
+            # LIFE.md/JOURNAL.md files (bounded, but still disk I/O), which
+            # must not run on the gateway event loop.
+            session_key, msg = await asyncio.to_thread(build_cron_session_context, job)
 
             # ── Concurrent execution guard ──
             if (job.script or job.command) and job.id in self._running_script_ids:
