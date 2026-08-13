@@ -139,22 +139,29 @@ Go to **Features → OAuth & Permissions → Bot Token Scopes** and add:
 | `chat:write` | Send, update, and delete messages |
 | `channels:history` | Read channel messages (for @mentions) |
 | `channels:read` | List public channels (the channel picker) and read channel metadata |
-| `groups:read` | Same, for private channels the bot is in |
+| `groups:history` | Read messages and thread replies in private channels the bot is in |
+| `groups:read` | List private channels the bot is in and read their metadata |
 | `im:history` | Read DM history |
 | `im:read` | View DM metadata |
 | `im:write` | Open DMs |
 | `reactions:write` | Add and remove emoji reactions |
 | `files:read` | Read uploaded files |
 | `files:write` | Upload screenshots |
+| `users:read` | Profile lookups (`users.info`) resolve a sender's real name. Without it the lookup fails and is caught: the display name falls back to the matching `slack.allowed_users` entry, then to the raw Slack member ID |
 | `commands` | Slash commands |
 
-Two scopes are deliberately **not** in the shipped manifest, so Path B should
-leave them out unless you want the extra behavior:
+One scope is deliberately **not** in the shipped manifest, so Path B should
+leave it out unless you want the extra behavior:
 
 | Scope | What adding it buys |
 |-------|---------------------|
 | `emoji:read` | Custom workspace emojis appear in the emoji picker |
-| `users:read` | Profile lookups (`users.info`) resolve a sender's real name. Without it those calls fail and are caught: the display name falls back to the matching `slack.allowed_users` entry, then to the raw Slack member ID |
+
+> **Upgrading an existing app?** Adding a scope to the manifest does not
+> retroactively grant it: Slack only grants new scopes when the app is
+> **reinstalled** to the workspace. After adding scopes (or importing an
+> updated manifest), go to **Settings → Install App → Reinstall to Workspace**
+> and copy the new Bot Token.
 
 ### Step 4. Subscribe to Events
 
@@ -162,6 +169,7 @@ leave them out unless you want the extra behavior:
 2. Under **Subscribe to bot events**, add all of these:
    - `message.im`
    - `message.channels`
+   - `message.groups`
    - `app_mention`
    - `app_home_opened`
    - `file_change`
