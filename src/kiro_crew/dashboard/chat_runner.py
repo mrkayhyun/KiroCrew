@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import re
+import shlex
 import stat as stat_module
 import time
 from datetime import datetime, timezone
@@ -38,6 +39,7 @@ from kiro_crew.acp.types import (
 )
 from kiro_crew.agent_discovery import warm_project_agent_names
 from kiro_crew.autonudge import get_instance
+from kiro_crew.browser_cli import install as browser_cli_install
 from kiro_crew.config.loader import (
     KiroCrewConfig,
     data_home,
@@ -1720,15 +1722,17 @@ def _safe_native_crew_debug_title(title: str) -> str:
     return safe
 
 
-def _matches_trusted_pattern(tool_title: str, patterns: set[str]) -> str | None:
-    """Return the matched pattern if tool_title matches any trusted pattern.
+def _split_command_segments(tool_title: str) -> tuple[str, list[str]] | None:
+    """Split a shell tool title into its unquoted command segments.
 
-    For piped/chained commands, splits into segments and checks each
-    independently — ALL segments must match for the command to be trusted.
-    Returns comma-joined matched patterns for audit provenance.
+    Returns ``(normalized_title, segments)``. Returns ``None`` — which every
+    caller MUST treat as "deny" — when the command contains substitution
+    (``$(...)``, backticks, process substitution), because no amount of
+    per-segment matching can reach inside a sub-command.
 
-    Deny-by-default for commands containing command substitution ($(...),
-    backticks, process substitution) — fnmatch cannot reach sub-commands.
+    Extracted so that every command-keyed approval path shares ONE splitter:
+    a second, independently written shell splitter is exactly how a bypass
+    gets introduced (quoted separators, masked redirects, backgrounding).
     """
     normalized = _normalize_tool_name(tool_title)
     if _CMD_SUBSTITUTION_RE.search(normalized):
@@ -1762,6 +1766,23 @@ def _matches_trusted_pattern(tool_title: str, patterns: set[str]) -> str | None:
             if ph in restored:
                 restored = restored.replace(ph, ch)
         segments.append(restored)
+    return normalized, segments
+
+
+def _matches_trusted_pattern(tool_title: str, patterns: set[str]) -> str | None:
+    """Return the matched pattern if tool_title matches any trusted pattern.
+
+    For piped/chained commands, splits into segments and checks each
+    independently — ALL segments must match for the command to be trusted.
+    Returns comma-joined matched patterns for audit provenance.
+
+    Deny-by-default for commands containing command substitution ($(...),
+    backticks, process substitution) — fnmatch cannot reach sub-commands.
+    """
+    split = _split_command_segments(tool_title)
+    if split is None:
+        return None
+    normalized, segments = split
     if len(segments) > 1:
         matched_patterns = []
         for seg in segments:
@@ -1778,6 +1799,204 @@ def _matches_trusted_pattern(tool_title: str, patterns: set[str]) -> str | None:
         if _tool_matches(pattern, tool_title) or _tool_matches(pattern, normalized):
             return pattern
     return None
+
+
+_BROWSER_CLI_BIN = "playwright-cli"
+
+# Verbs whose entire effect stays INSIDE the browser page/session. These are
+# auto-approved when the Playwright CLI is installed (presence-as-consent), so
+# that ordinary browsing does not prompt on every step.
+#
+# This is an ALLOWLIST, not a denylist, so a verb added by a future CLI release
+# is denied until it is reviewed and listed — fail-closed, not fail-open.
+_BROWSER_CLI_PAGE_VERBS = frozenset(
+    {
+        # Core / lifecycle
+        "open", "attach", "close", "detach", "goto", "resize", "delete-data",
+        # Interaction
+        "type", "click", "dblclick", "fill", "drag", "drop", "hover",
+        "select", "check", "uncheck",
+        # Reading the page
+        "snapshot", "find", "generate-locator", "highlight",
+        # Dialogs
+        "dialog-accept", "dialog-dismiss",
+        # Navigation
+        "go-back", "go-forward", "reload",
+        # Keyboard / mouse
+        "press", "keydown", "keyup",
+        "mousemove", "mousedown", "mouseup", "mousewheel",
+        # Capture (writes only into the service's own output dir)
+        "screenshot", "pdf",
+        # Tabs
+        "tab-list", "tab-new", "tab-close", "tab-select",
+        # Page-scoped storage MUTATION only. The READ verbs are deliberately
+        # absent -- see the exclusion note below: "inside the page" is not the
+        # same as "not sensitive", and a cookie IS the session credential.
+        "cookie-set", "cookie-delete", "cookie-clear",
+        "localstorage-set", "localstorage-delete", "localstorage-clear",
+        "sessionstorage-set", "sessionstorage-delete", "sessionstorage-clear",
+        # Network: mocking and the request LIST (numbers + URLs). The per-request
+        # header/body readers are excluded, because a request's headers carry the
+        # Authorization and Cookie values verbatim.
+        "requests",
+        "route", "route-list", "unroute", "network-state-set",
+        # `network` is the docs' name for the request listing that this CLI
+        # version spells `requests`; both are read-only, so both are listed.
+        "network", "config-print",
+        # DevTools / diagnostics
+        "console", "tracing-start", "tracing-stop",
+        "video-stop", "video-chapter", "video-show-actions", "video-hide-actions",
+        "show", "pause-at", "resume", "step-over",
+        # Session management
+        "list", "close-all", "kill-all",
+    }
+)
+
+# Auto-approvable ONLY in their bare form, because a positional argument turns
+# them into an arbitrary-local-path WRITE. Bare, both write inside the output
+# dir that ``browser_cli.snapshots`` points the CLI at.
+_BROWSER_CLI_BARE_ONLY_VERBS = frozenset({"video-start"})
+
+# Deliberately absent from every set above, so they keep interactive approval:
+#   eval / run-code      — run attacker-authored code in an authenticated page;
+#                          with fetch() that is a complete exfiltration path.
+#   upload               — sends an arbitrary LOCAL file to the current page.
+#   state-load           — reads an arbitrary local path and injects the cookies
+#                          it finds into the live session.
+#   install / install-browser — mutate the machine; installation is the
+#                          dashboard's job (Settings > Browser), not the agent's.
+#   cookie-list / cookie-get, localstorage-list / -get,
+#   sessionstorage-list / -get  — RETURN the session credential itself. These
+#                          were auto-approved in a first version on the reasoning
+#                          that their effect stays "inside the page"; that
+#                          conflates blast radius with sensitivity. The effect of
+#                          a read is the VALUE it prints into the agent's
+#                          context, and for these verbs that value is the login.
+#   request / request-headers / request-body, response-headers / response-body
+#                        — print a request's headers verbatim, i.e. its
+#                          Authorization and Cookie values. `requests` (the
+#                          numbered list of URLs) stays allowed.
+#   state-save           — serialises the WHOLE storage state, cookies included,
+#                          to a file the agent can then read with its own file
+#                          tools. Bare-form no longer helps: the file is the
+#                          credential.
+# A prompt-injected agent must not be able to convert "browsing is allowed"
+# into arbitrary code execution, arbitrary local reads, or arbitrary writes.
+
+
+# Flags that carry no local-filesystem path and no code. An ALLOWLIST for the
+# same fail-closed reason as the verb list. It is load-bearing rather than
+# cosmetic: the CLI takes an output path as `--filename=<name>`, so a path can
+# arrive as a FLAG and not only as a positional argument. Skipping unrecognized
+# flags on the way to the verb would therefore auto-approve an arbitrary local
+# WRITE. Anything not listed here falls through to interactive approval --
+# notably:
+#   --filename  MEASURED: the value is resolved against the CLI invocation's
+#               CWD, *not* against PLAYWRIGHT_MCP_OUTPUT_DIR (that variable only
+#               governs auto-generated names). So even a bare
+#               `--filename=README.md` overwrites a file in the user's repo, and
+#               there is no "safe" spelling of it to allow. The un-named form
+#               (`playwright-cli screenshot`) IS auto-approved and writes into
+#               the service's own directory, printing the path -- so the capture
+#               loop keeps working without this flag.
+#   --profile / --config  name a local path to READ.
+_BROWSER_CLI_SAFE_FLAGS = frozenset(
+    {
+        "-s", "--json", "--raw", "--help", "--version",
+        "--headed", "--browser", "--persistent",
+        "--extension", "--cdp", "--endpoint",
+        "--domain", "--hide",
+        # Shape-only capture options: they change the image, not its location.
+        "--type", "--full-page", "--hires",
+    }
+)
+
+
+def _has_unquoted_redirect(text: str) -> bool:
+    """True when *text* contains a shell redirection outside quotes.
+
+    Load-bearing for approval, not cosmetic. A redirection is performed by the
+    SHELL before the command ever runs, so an otherwise-approved
+    ``playwright-cli snapshot`` with ``> somefile`` appended CREATES OR TRUNCATES
+    that file. The verb and flag allowlists cannot see it: ``>`` and the path
+    arrive as ordinary tokens, and the segment splitter does not cut on ``>``,
+    so the whole thing reads as "snapshot with two extra positionals".
+
+    Quote-aware on purpose. ``click "div > span"`` is a legitimate CSS selector,
+    so rejecting every ``>`` would break real browsing; only an UNQUOTED one is
+    a redirection.
+    """
+    quote: str | None = None
+    escaped = False
+    for ch in text:
+        if escaped:
+            escaped = False
+            continue
+        # Backslash escapes the next character everywhere except inside single
+        # quotes, where the shell treats it literally.
+        if ch == "\\" and quote != "'":
+            escaped = True
+            continue
+        if quote is not None:
+            if ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            continue
+        if ch in "><":
+            return True
+    return False
+
+
+def _is_browser_cli_command(tool_title: str) -> bool:
+    """True when EVERY segment of a shell command is an auto-approvable
+    ``playwright-cli`` page-scoped verb.
+
+    Matched against the REAL command recovered from ``tool_input`` — never the
+    model-authored title, which an injected agent controls and could forge.
+    Reuses :func:`_split_command_segments`, so command substitution and quoted
+    separators are handled by the one hardened splitter.
+    """
+    split = _split_command_segments(tool_title)
+    if split is None:
+        return False
+    _, segments = split
+    if not segments:
+        return False
+    for seg in segments:
+        # BEFORE tokenizing: a redirection is the shell's work, not the CLI's, so
+        # no amount of verb checking can make it safe.
+        if _has_unquoted_redirect(seg):
+            return False
+        try:
+            tokens = shlex.split(seg)
+        except ValueError:
+            return False  # unbalanced quotes — cannot reason about it
+        if len(tokens) < 2 or tokens[0] != _BROWSER_CLI_BIN:
+            return False
+        # Separate flags from positionals. Every flag must be recognized as
+        # path-free and code-free; an UNKNOWN flag denies the whole command
+        # rather than being skipped over on the way to the verb.
+        positionals: list[str] = []
+        for tok in tokens[1:]:
+            if tok.startswith("-"):
+                if tok.split("=", 1)[0] not in _BROWSER_CLI_SAFE_FLAGS:
+                    return False
+            else:
+                positionals.append(tok)
+        if not positionals:
+            return False
+        verb = positionals[0]
+        if verb in _BROWSER_CLI_PAGE_VERBS:
+            continue
+        # Bare only: MEASURED, an output name is resolved against the CLI's CWD,
+        # so any argument here is an arbitrary local write. Bare, both write into
+        # the service's own directory.
+        if verb in _BROWSER_CLI_BARE_ONLY_VERBS and len(positionals) == 1:
+            continue
+        return False
+    return True
 
 
 def _extract_base_command(tool_title: str) -> str:
@@ -5018,6 +5237,68 @@ async def _run_chat(
                             metadata={"reason": "trusted_pattern", "pattern": matched},
                         )
                         continue
+                # Browser CLI: auto-approve page-scoped `playwright-cli` verbs so
+                # that browsing does not prompt on every step. Placed AFTER the
+                # user's own trusted patterns (a user grant still wins and is
+                # logged as such) and, like that branch, keyed on the REAL command
+                # from tool_input — never event.title, which the model authors.
+                # Consent is the install itself: the binary is only on PATH
+                # because the user (or this dashboard, at their click) put it
+                # there. Verbs that escape the page — arbitrary code, arbitrary
+                # local reads/writes, installers — are excluded by allowlist and
+                # still prompt.
+                # `is_shell` is REQUIRED, not belt-and-braces:
+                # `_extract_bash_command` reads the `command` field out of ANY
+                # tool_input JSON and falls back to the raw input, so without this
+                # gate a non-shell tool that happens to carry a `command` field
+                # (cron_add, which can schedule a shell command) would be
+                # auto-approved here — turning "browsing is allowed" into
+                # "creating a durable scheduled job is allowed".
+                _bc_cmd = (
+                    _extract_bash_command(event.tool_input)
+                    if (event.is_shell and event.tool_input)
+                    else ""
+                )
+                _bc_ok = False
+                if _bc_cmd and _is_browser_cli_command(f"Running: {_bc_cmd}"):
+                    # Presence IS the consent signal, so verify it rather than
+                    # assuming it: with no binary on PATH the user never opted in,
+                    # and a `playwright-cli` call is anomalous enough to prompt.
+                    _bc_ok = browser_cli_install.available()
+                if _bc_ok:
+                    try:
+                        validated_tool = _validate_tool_name(event.title, is_shell=event.is_shell)
+                    except ValueError as e:
+                        await client.reject_tool(event.request_id)
+                        _safe = _redact_display_text(event.title)
+                        slot.append("tool", f"🚫 {_safe} (invalid: {e})", "msg msg-tool")
+                        sel().log_tool_invocation(
+                            session_key=session_key,
+                            agent=slot.agent or "kirocrew",
+                            source="dashboard",
+                            tool_name=_safe,
+                            tool_kind=event.tool_kind,
+                            outcome="rejected",
+                            request_id=event.request_id,
+                            metadata={"reason": "invalid_tool_name", "pattern": "browser_cli"},
+                        )
+                        continue
+                    await client.approve_tool(event.request_id)
+                    _tool_title = _broadcast_auto_tool(state, slot, event)
+                    _tool_title, _ = redact_exfiltration_urls(_tool_title)
+                    _tool_title, _ = redact_credentials(_tool_title)
+                    slot.append("tool", f"🔧 {_tool_title}", "msg msg-tool")
+                    sel().log_tool_invocation(
+                        session_key=session_key,
+                        agent=slot.agent or "kirocrew",
+                        source="dashboard",
+                        tool_name=_tool_title,
+                        tool_kind=event.tool_kind,
+                        outcome="auto_approved",
+                        request_id=event.request_id,
+                        metadata={"reason": "browser_cli"},
+                    )
+                    continue
                 # Trust-reads: auto-approve read-only bash commands
                 # Detect bash tools by tool_input content (title is human-readable)
                 cmd = _extract_bash_command(event.tool_input) if event.tool_input else ""

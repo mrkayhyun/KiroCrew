@@ -15,11 +15,12 @@ from __future__ import annotations
 import json
 import logging
 import re
-from pathlib import Path
+
+from kiro_crew.config.paths import kiro_home
 
 logger = logging.getLogger(__name__)
 
-_KIRO_MCP_JSON = Path.home() / ".kiro" / "settings" / "mcp.json"
+_KIRO_MCP_JSON = kiro_home() / "settings" / "mcp.json"
 
 # Managed servers whose command is the kirocrew binary itself.
 # Only these are affected by install-method path changes.
@@ -35,6 +36,30 @@ PREDECESSOR_BIN_MCP_SERVERS = frozenset({"meshclaw-cron", "meshclaw-core"})
 # Every managed-binary server name KiroCrew is responsible for removing from
 # the user's global mcp.json (KiroCrew never legitimately writes these there).
 STALE_MANAGED_MCP_SERVERS = frozenset(KIROCREW_BIN_MCP_SERVERS) | PREDECESSOR_BIN_MCP_SERVERS
+
+
+# The argv token the deleted Playwright MCP proxy was registered with. An entry
+# still carrying it spawns `kirocrew mcp-playwright-proxy`, a subcommand this
+# release removed, so kiro-cli hits ModuleNotFoundError on EVERY session until
+# the entry goes. Browsing is gone either way (there is no proxy any more), so
+# the only question is whether the operator also gets a crash on every session.
+_DELETED_PROXY_ARGV_TOKEN = "mcp-playwright-proxy"
+
+
+def _invokes_deleted_playwright_proxy(spec: object) -> bool:
+    """True if a server spec launches the Playwright MCP proxy this release deleted.
+
+    Matched on the ARGV token, never on the server name. The canonical name was
+    ``playwright-mcp``, but that is also what an operator's OWN Playwright server
+    is called, and purging by name would delete a server Kiro Crew never wrote --
+    the same trap ``_invokes_meshclaw`` exists to avoid.
+    """
+    if not isinstance(spec, dict):
+        return False
+    args = spec.get("args", [])
+    if not isinstance(args, list):
+        return False
+    return any(isinstance(a, str) and a == _DELETED_PROXY_ARGV_TOKEN for a in args)
 
 
 def _invokes_meshclaw(spec: object) -> bool:
@@ -93,7 +118,9 @@ def clean_stale_managed_mcp() -> list[str]:
     removed = sorted(
         name
         for name, spec in servers.items()
-        if name in STALE_MANAGED_MCP_SERVERS or _invokes_meshclaw(spec)
+        if name in STALE_MANAGED_MCP_SERVERS
+        or _invokes_meshclaw(spec)
+        or _invokes_deleted_playwright_proxy(spec)
     )
     if not removed:
         return []

@@ -48,7 +48,6 @@ from kiro_crew.agent_files import (
     REQUIRED_KIRO_AGENT_FILES,
 )
 from kiro_crew.agent_files import RESEARCH_AGENT_FILENAME as _RESEARCH_AGENT_FILENAME
-from kiro_crew.browser.setup import converge_playwright_servers
 from kiro_crew.config import config_dir
 from kiro_crew.config import config_path as _mc_config_path
 from kiro_crew.config.paths import (
@@ -2505,16 +2504,6 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
     # already-broken configs); runs after merges so global-only servers and
     # their stale @refs are normalized too. See mcp_server_alias.
     _normalize_mcp_server_keys(config)
-
-    # Converge every Playwright-proxy entry onto the single canonical
-    # ``playwright-mcp`` server, keyed by resolved launch target. Runs on EVERY
-    # rebuild (not just gateway boot) so a slash-free legacy proxy key —
-    # e.g. ``playwright-proxy-mcp`` re-injected from ~/.kiro/crew/mcp.json by the
-    # merges above — cannot survive to spawn a second backend. Slash-free legacy
-    # keys are invisible to _normalize_mcp_server_keys (which only rewrites
-    # slash-containing keys), so this launch-target-keyed pass closes the
-    # duplicate for them.
-    converge_playwright_servers(config)
 
     # Sync shared (user-installed) servers to tools/allowedTools.
     # These are explicitly installed by the user via `aim mcp install` or
