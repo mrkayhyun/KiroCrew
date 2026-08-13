@@ -3749,7 +3749,10 @@
     "instanceTabBar": {
       "instances": "Remote crews",
       "local": "Local",
-      "local_dashboard": "Local dashboard"
+      "local_dashboard": "Local dashboard",
+      "n_unread": "{{n}} unread",
+      "switch_crew_active": "Switch crew, currently {{name}}",
+      "switch_crew_active_unread": "Switch crew, currently {{name}}, {{n}} unread elsewhere"
     },
     "instancesViewport": {
       "loading_pane": "Loading pane…",
@@ -7400,7 +7403,15 @@
         "tier_spec": "{{instanceType}} · {{arch}} · {{vcpu}} vCPU · {{ramGb}} GB RAM · {{diskGb}} GB disk",
         "start": "Start",
         "start_crew": "Start {{name}}",
-        "sign_in_unconfirmed": "We could not confirm the sign-in. The code below may still work — finish it here, then connect the crew."
+        "sign_in_unconfirmed": "We could not confirm the sign-in. The code below may still work — finish it here, then connect the crew.",
+        "more_actions": "More actions for {{name}}",
+        "edit_settings": "Edit settings",
+        "edit_crew": "Edit {{name}}",
+        "save_changes": "Save changes",
+        "saving": "Saving…",
+        "failed_to_save_crew": "Could not save this crew",
+        "edit_reconnect_note": "Changing the host, port, or connection method closes the current tunnel and reopens it with the new settings.",
+        "remove": "Remove…"
       },
       "webhooksPanel": {
         "inbound_webhooks": "Inbound webhooks",

@@ -5091,7 +5091,11 @@
       "tunnel_connected_token_valid_auto_refresh": "টানেল সংযুক্ত। টোকেন {{valid}} পর্যন্ত বৈধ; স্বয়ংক্রিয় রিফ্রেশ {{refresh}}।",
       "tunnel_connecting": "টানেল কানেক্ট হচ্ছে…",
       "tunnel_error": "টানেল ত্রুটি",
-      "tunnel_state": "টানেল {{state}}।"
+      "tunnel_state": "টানেল {{state}}।",
+      "n_unread": "{{n}} অপঠিত",
+      "switch_crew_active": "ক্রু বদলান, বর্তমানে {{name}}",
+      "switch_crew_active_unread": "ক্রু বদলান, বর্তমানে {{name}}, অন্যগুলিতে {{n}} অপঠিত",
+      "stopped": "বন্ধ"
     },
     "instancesViewport": {
       "connecting": "কানেক্ট হচ্ছে…",
@@ -11054,7 +11058,15 @@
         "tier_spec": "{{instanceType}} · {{arch}} · {{vcpu}} vCPU · {{ramGb}} GB RAM · {{diskGb}} GB disk",
         "start": "Start",
         "start_crew": "Start {{name}}",
-        "sign_in_unconfirmed": "We could not confirm the sign-in. The code below may still work — finish it here, then connect the crew."
+        "sign_in_unconfirmed": "We could not confirm the sign-in. The code below may still work — finish it here, then connect the crew.",
+        "more_actions": "{{name}} এর জন্য আরও ক্রিয়া",
+        "edit_settings": "সেটিংস সম্পাদনা করুন",
+        "edit_crew": "{{name}} সম্পাদনা করুন",
+        "save_changes": "পরিবর্তন সংরক্ষণ করুন",
+        "saving": "সংরক্ষণ করা হচ্ছে…",
+        "failed_to_save_crew": "এই ক্রু সংরক্ষণ করা যায়নি",
+        "edit_reconnect_note": "হোস্ট, পোর্ট বা সংযোগ পদ্ধতি বদলালে বর্তমান টানেল বন্ধ হয়ে নতুন সেটিংস দিয়ে আবার খোলে।",
+        "remove": "সরাও…"
       },
       "webhooksPanel": {
         "inbound_webhooks": "ইনবাউন্ড webhook",

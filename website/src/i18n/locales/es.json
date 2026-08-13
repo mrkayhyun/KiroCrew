@@ -5172,7 +5172,11 @@
       "tunnel_connected_token_valid_auto_refresh": "Túnel conectado. Token válido {{valid}}; renovación automática {{refresh}}.",
       "tunnel_connecting": "Conectando el túnel…",
       "tunnel_error": "error del túnel",
-      "tunnel_state": "Túnel {{state}}."
+      "tunnel_state": "Túnel {{state}}.",
+      "n_unread": "{{n}} sin leer",
+      "switch_crew_active": "Cambiar de crew, actualmente {{name}}",
+      "switch_crew_active_unread": "Cambiar de crew, actualmente {{name}}, {{n}} sin leer en otros",
+      "stopped": "detenido"
     },
     "instancesViewport": {
       "connecting": "Conectando…",
@@ -11173,7 +11177,15 @@
         "tier_spec": "{{instanceType}} · {{arch}} · {{vcpu}} vCPU · {{ramGb}} GB RAM · {{diskGb}} GB disk",
         "start": "Start",
         "start_crew": "Start {{name}}",
-        "sign_in_unconfirmed": "We could not confirm the sign-in. The code below may still work — finish it here, then connect the crew."
+        "sign_in_unconfirmed": "We could not confirm the sign-in. The code below may still work — finish it here, then connect the crew.",
+        "more_actions": "Más acciones para {{name}}",
+        "edit_settings": "Editar configuración",
+        "edit_crew": "Editar {{name}}",
+        "save_changes": "Guardar cambios",
+        "saving": "Guardando…",
+        "failed_to_save_crew": "No se pudo guardar este crew",
+        "edit_reconnect_note": "Cambiar el host, el puerto o el método de conexión cierra el túnel actual y lo vuelve a abrir con la nueva configuración.",
+        "remove": "Quitar…"
       },
       "webhooksPanel": {
         "inbound_webhooks": "Webhooks entrantes",

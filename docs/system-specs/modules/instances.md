@@ -3,7 +3,7 @@
 Lets a single Kiro Crew gateway (the **hub**) manage and switch between several
 **remote** Kiro Crew instances (dev hosts, EC2, home servers) over SSH **or AWS
 SSM Session Manager** tunnels, embedding each remote dashboard as an iframe pane
-below a tab strip. Opt-in: off by default (`instances.enabled`). The transport is
+below a switcher strip. Opt-in: off by default (`instances.enabled`). The transport is
 per-instance (`connection_method`) — see §13.
 
 > **Section numbers in this document are an API.** `src/kiro_crew/cloud/connect.py`
@@ -43,9 +43,12 @@ A Kiro Crew gateway normally binds the dashboard to loopback only. The Instances
 feature lets the hub reach *other* gateways running on remote hosts by opening an
 SSH `-L` forward to each remote's loopback dashboard port, minting a short-lived
 dashboard token on the remote, and embedding the remote dashboard in an
-`<iframe>`. You switch panes with a tab strip (`InstanceTabBar`, plus
+`<iframe>`. You switch panes from a dropdown (`InstanceTabBar`, plus
 Cmd/Ctrl+digit in the Electron shell); the hub keeps the most-recently-used set
-"warm" (tunnel + iframe live) and lazily reconnects the rest.
+"warm" (tunnel + iframe live) and lazily reconnects the rest. The switcher is a
+menu rather than a row of chips because the number of configured crews is
+unbounded: the strip costs constant width, and unread counts stay visible on the
+closed trigger as an aggregate badge over every crew that is not on screen.
 
 **Key properties**
 
@@ -96,9 +99,9 @@ after startup and a restart is still pending.
  +----------------------- Hub gateway (this host) ------------------------+
  |                                                                       |
  |  Dashboard SPA                                                        |
- |   |- InstanceTabBar     (Local | remote-1 | remote-2 ...)             |
+ |   |- InstanceTabBar    switcher dropdown: Local + crews with intent   |
  |   |- InstancesViewport  warm <iframe>s: http://<host>:<port>/?token=  |
- |   +- Settings > Instances   add / connect / diagnose / remove         |
+ |   +- Settings > Instances   add / edit / connect / diagnose / remove  |
  |            | owner-only JSON API (SEL-audited)                        |
  |  dashboard/handlers_instances.py                                      |
  |            |                                                          |
@@ -170,8 +173,8 @@ direct `os.kill(pid, signal.SIGTERM)` rather than going through
    re-runs the token handshake) with a live tunnel and WebSocket. Exceeding the
    cap **evicts the least-recently-used non-active iframe**. Eviction unmounts
    the iframe only: it does NOT disconnect the tunnel or clear `was_connected`,
-   so the tab persists and re-warms on the next click. Tabs disappear only on an
-   explicit disconnect.
+   so the switcher entry persists and re-warms on the next click. Entries
+   disappear only on an explicit disconnect.
 3. **Health probe.** While CONNECTED, a per-tunnel loop polls the loopback
    forward every `DEFAULT_PROBE_INTERVAL_SECS` (30s, not user-configurable;
    `<= 0` disables the probe); after `probe_failure_threshold` (3) *consecutive*
@@ -211,7 +214,7 @@ mirrored ports) and each wrapped, so one unreachable host neither aborts the res
 nor crashes startup. It runs as a background task rather than awaited, because
 `on_startup` fires *before* the HTTP port is bound and serial SSH connects would
 delay the bind past the desktop app's gateway-wait window. A failed revive leaves
-`was_connected` true and records the failure reason, so the tab persists showing
+`was_connected` true and records the failure reason, so the entry persists showing
 why it is down.
 
 ---
@@ -279,9 +282,9 @@ Two persisted hints drive lazy reconnect:
 
 - `was_connected` is sticky "connection intent". It is set when a tunnel opens
   and cleared **only** on an explicit user disconnect, deliberately surviving
-  gateway shutdown and a failed auto-revive, so the frontend keeps the tab in an
+  gateway shutdown and a failed auto-revive, so the frontend keeps the entry in an
   error / click-to-reconnect state instead of dropping it. It is also what the
-  frontend keys tab visibility on (`was_connected || connected || warm`).
+  frontend keys entry visibility on (`was_connected || connected || warm`).
 - `last_active_id` records the instance most recently connected to. `connect()`
   writes it and `remove()` clears it, and any value that no longer resolves to a
   live record is dropped on the next write. Nothing in the gateway reads it:
@@ -306,7 +309,7 @@ request with no `request["user"]` with `401`, and rejects a disabled feature wit
 |---|---|
 | `GET /api/instances` | List instances + live status + `warm_set_cap` + `active`. |
 | `POST /api/instances` | Add an instance. |
-| `PATCH /api/instances/{id}` | Edit `name`/`ssh_host`/`remote_port`/`ttl`/`remote_bin` (internal hints are not editable). |
+| `PATCH /api/instances/{id}` | Edit `name`/`ssh_host`/`remote_port`/`ttl`/`remote_bin`/`connection_method`/`ssm_target`/`ssm_run_as`/`aws_profile`/`aws_region` (`id` and internal hints are not editable). Editing a field the tunnel is BUILT from (everything except `name` and `ttl`) disconnects a live tunnel first, because it would otherwise keep forwarding the old port to the old host under the new label; the teardown passes `keep_intent=True` so it does not touch `was_connected` — that flag records a USER disconnect, so a reconfiguration leaves it alone and a real disconnect arriving mid-edit still wins. The crew therefore keeps its switcher entry and reconnects in one click. The teardown runs AGAIN after the write: `connect()` is idempotent, so a reconnect racing the two awaits would otherwise pin a tunnel built from the old coordinates to the new settings — the same window `DELETE` closes with its post-removal sweep. Optional fields travel as explicit empty values on an edit, so emptying one clears it instead of being read as "leave as-is". |
 | `DELETE /api/instances/{id}` | Disconnect then remove. |
 | `POST /api/instances/{id}/connect` | Open tunnel + mint token. Returns the token. |
 | `POST /api/instances/{id}/refresh-token` | Force a fresh mint and return the new token. See below. |
@@ -396,11 +399,13 @@ it is reachable only by an authenticated owner driving the API directly.
    - *Remote kirocrew path*: only needed when `kirocrew` lives somewhere
      non-standard on the remote.
 4. Click **Connect**. The hub opens the tunnel and mints a token.
-5. **Switch** panes from the tab strip in the top header (**Local** returns to
-   your own dashboard). In the Electron shell, Cmd/Ctrl+digit jumps between panes
-   in tab order.
-6. **Diagnose** a flaky instance (runs the ladder), or **Disconnect** /
-   **Remove** from its row.
+5. **Switch** panes from the switcher dropdown in the top header (**Local**
+   returns to your own dashboard). In the Electron shell, Cmd/Ctrl+digit jumps
+   between panes in switcher order.
+6. **Diagnose** a flaky instance (runs the ladder), or **Disconnect** from its
+   row. **Edit settings** / **Remove** live in the row's overflow menu — a row
+   shows two primary actions plus that menu, so everything past them is one
+   menu deep.
 
 > Prerequisite: you can already `ssh <ssh_host>` non-interactively from the hub
 > (a valid key or cert in your `ssh-agent`, no password prompt), and the remote
@@ -570,7 +575,7 @@ whose current variable parts are all charset-bound literals.
 | Connect fails for another reason | Use **Diagnose**. The ladder reports the first broken link: `ssh_unreachable` (check SSH access or the host alias), `remote_down` (remote gateway not listening), `not_connected` (SSH and remote are fine, this instance has no tunnel yet: click Connect), or `tunnel_down` (reconnect). |
 | "local port N is already in use" | The forward mirrors the remote port, so two instances cannot share one. Change this instance's remote port (and the remote gateway's own port to match), or stop whatever holds the port. |
 | Instance keeps dropping | The health probe plus 2-tier self-heal retry over roughly a two-minute window (8 attempts, capped-exponential backoff). Tune `instances.max_recovery_attempts` / `recover_backoff_max_secs` / `probe_failure_threshold`; both recovery values are clamped so they cannot loop indefinitely. If self-heal gives up, diagnosis runs automatically. Check the remote gateway and SSH stability. |
-| A pane vanished from the warm set but its tab is still there | It was LRU-evicted (warm set full). The tunnel is untouched: clicking the tab re-warms it. Raise `instances.warm_set_cap` if you want more panes resident. |
+| A pane vanished from the warm set but its switcher entry is still there | It was LRU-evicted (warm set full). The tunnel is untouched: selecting the crew re-warms it. Raise `instances.warm_set_cap` if you want more panes resident. |
 | Every token mint fails on one remote, though its gateway is healthy | The remote's `~/.local/bin/kirocrew` probably points at an uninstalled checkout. See §12: the run-marker is what makes mint follow the *running* gateway's install. |
 
 ---
@@ -610,7 +615,7 @@ Where it is called, and what each caller does with a rejection:
 
 | Caller | Behavior on rejection |
 |--------|----------------------|
-| `SshTunnelManager.connect()` | Returns an ERROR status carrying "invalid ssh settings", retained in `_last_error` so the tab can explain itself. |
+| `SshTunnelManager.connect()` | Returns an ERROR status carrying "invalid ssh settings", retained in `_last_error` so the switcher entry can explain itself. |
 | `SshTunnelManager._recover()` | Aborts self-heal for that instance with a warning (no point retrying an unusable record). |
 | `SshTunnelManager._refresh_token_once()` | Aborts the refresh with a warning. |
 | `SshTunnelManager.restart_remote()` | Returns `{ok: false, message: "invalid ssh settings: ..."}`. |

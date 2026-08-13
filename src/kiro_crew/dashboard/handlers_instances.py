@@ -18,6 +18,7 @@ crosses this boundary, it is never logged, and it never appears in list/status.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 from typing import TYPE_CHECKING
 
@@ -262,14 +263,100 @@ async def api_instances_update(request: web.Request) -> web.Response:
         "aws_region",
     }
     changes = {k: v for k, v in body.items() if k in allowed}
+    # A tunnel is opened from these fields, so editing one of them makes a live
+    # tunnel wrong rather than merely out of date: it keeps forwarding the old
+    # port to the old host under the new label. Tear it down as part of the save
+    # so the next connect builds from what the user just entered.
+    transport_keys = {
+        "ssh_host",
+        "remote_port",
+        "connection_method",
+        "ssm_target",
+        "ssm_run_as",
+        "aws_profile",
+        "aws_region",
+        "remote_bin",
+    }
+    current = await asyncio.to_thread(reg.get, instance_id)
+    if current is None:
+        _audit("update", "denied", request_id=instance_id, error="not found")
+        return web.json_response(
+            {"error": "not found", "code": "instance_not_found"}, status=404
+        )
+    transport_changed = any(
+        k in transport_keys and v != getattr(current, k) for k, v in changes.items()
+    )
+    # Validate the PROPOSED record before touching the tunnel. The registry
+    # validates too, but that happens after the teardown — so a rejected edit
+    # would answer 400 having already disconnected a healthy crew, punishing the
+    # user for a typo the save never accepted.
+    try:
+        dataclasses.replace(current, **changes).validate()  # type: ignore[arg-type]
+    except (InvalidInstanceError, TypeError, ValueError) as e:
+        _audit("update", "denied", request_id=instance_id, error=str(e))
+        return web.json_response({"error": str(e), "code": "instance_invalid"}, status=400)
+    mgr = getattr(state, "instances_manager", None)
+
+    async def _teardown() -> bool:
+        """Drop the tunnel, reporting whether one was live. Never raises.
+
+        A teardown that fails must not block the edit: the record is what the
+        next connect builds from, and refusing to save would strand the user on
+        coordinates they already know are wrong.
+        """
+        if mgr is None:
+            return False
+        try:
+            # keep_intent: an edit is a reconfiguration, not the explicit user
+            # disconnect that owns `was_connected`. Leaving the flag to the
+            # manager means a real Disconnect arriving mid-edit wins, instead of
+            # being overwritten by a snapshot taken before the save began.
+            return bool(await mgr.disconnect(instance_id, keep_intent=True))
+        except Exception:
+            logger.warning(
+                "tunnel teardown failed while editing instance %s; "
+                "saving the edit anyway",
+                instance_id,
+                exc_info=True,
+            )
+            return False
+
+    if transport_changed:
+        if mgr is None:
+            # Nothing to tear down (the subsystem was off at startup), but say so:
+            # a silent skip here would look identical to a teardown that ran.
+            logger.warning(
+                "instance %s transport edited with no manager running; "
+                "no tunnel teardown performed",
+                instance_id,
+            )
+        else:
+            await _teardown()
     try:
         inst = await asyncio.to_thread(lambda: reg.update(instance_id, **changes))
     except InstanceNotFoundError as e:
         _audit("update", "denied", request_id=instance_id, error=str(e))
-        return web.json_response({"error": str(e)}, status=404)
+        return web.json_response(
+            {"error": str(e), "code": "instance_not_found"}, status=404
+        )
     except (InvalidInstanceError, InstancesError) as e:
         _audit("update", "denied", request_id=instance_id, error=str(e))
         return web.json_response({"error": str(e)}, status=400)
+    if transport_changed and mgr is not None:
+        # The teardown and the write are separate awaits, so a reconnect can slip
+        # in between them and open a tunnel from the OLD coordinates. connect()
+        # is idempotent, so that tunnel would then be handed out for the NEW
+        # settings forever — a live connection to the previous machine. Sweep
+        # once more now that the record holds the new coordinates: anything this
+        # finds was built from the old ones, and anything opened after this
+        # point is built from the new ones. Same window the remove handler
+        # closes with its post-removal sweep.
+        await _teardown()
+        # Re-read: the sweep cleared the port hint, so the response must report
+        # the state the caller now has rather than the pre-sweep record.
+        fresh = await asyncio.to_thread(reg.get, instance_id)
+        if fresh is not None:
+            inst = fresh
     _audit("update", "success", request_id=instance_id)
     return web.json_response(_instance_view(state, inst))
 

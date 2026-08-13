@@ -5253,7 +5253,11 @@
       "tunnel_connected_token_valid_auto_refresh": "Туннель подключён. Токен действителен {{valid}}; автообновление {{refresh}}.",
       "tunnel_connecting": "Туннель подключается…",
       "tunnel_error": "ошибка туннеля",
-      "tunnel_state": "Туннель {{state}}."
+      "tunnel_state": "Туннель {{state}}.",
+      "n_unread": "Непрочитанных: {{n}}",
+      "switch_crew_active": "Сменить экипаж, сейчас {{name}}",
+      "switch_crew_active_unread": "Сменить экипаж, сейчас {{name}}, непрочитанных в других: {{n}}",
+      "stopped": "остановлен"
     },
     "instancesViewport": {
       "connecting": "Подключение…",
@@ -11292,7 +11296,15 @@
         "tier_spec": "{{instanceType}} · {{arch}} · {{vcpu}} vCPU · {{ramGb}} GB RAM · {{diskGb}} GB disk",
         "start": "Start",
         "start_crew": "Start {{name}}",
-        "sign_in_unconfirmed": "We could not confirm the sign-in. The code below may still work — finish it here, then connect the crew."
+        "sign_in_unconfirmed": "We could not confirm the sign-in. The code below may still work — finish it here, then connect the crew.",
+        "more_actions": "Другие действия для {{name}}",
+        "edit_settings": "Изменить настройки",
+        "edit_crew": "Изменить {{name}}",
+        "save_changes": "Сохранить изменения",
+        "saving": "Сохранение…",
+        "failed_to_save_crew": "Не удалось сохранить этот экипаж",
+        "edit_reconnect_note": "Изменение хоста, порта или способа подключения закрывает текущий туннель и открывает его заново с новыми настройками.",
+        "remove": "Убрать…"
       },
       "webhooksPanel": {
         "inbound_webhooks": "Входящие webhooks",

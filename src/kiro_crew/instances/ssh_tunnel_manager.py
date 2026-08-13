@@ -1103,10 +1103,18 @@ class SshTunnelManager:
             self._last_error.pop(instance_id, None)
             return tunnel.status
 
-    async def disconnect(self, instance_id: str) -> bool:
+    async def disconnect(self, instance_id: str, *, keep_intent: bool = False) -> bool:
         """Tear down *instance_id*'s tunnel, drop its token, clear its port hint.
 
         Returns whether a live tunnel existed.
+
+        ``keep_intent`` distinguishes a RECONFIGURATION from a user disconnect.
+        ``was_connected`` records that the user wants this instance connected, so
+        only an explicit disconnect may clear it; a caller tearing a tunnel down
+        in order to rebuild it (an edit that changes the host or port) passes
+        ``keep_intent=True`` and leaves that flag alone. Restoring the flag
+        afterwards instead would race a real disconnect arriving mid-edit and
+        silently revive the instance the user just turned off.
 
         The persisted ``local_port`` is reset to the unallocated sentinel here —
         symmetric with :meth:`connect` setting it — so a disconnected instance
@@ -1133,12 +1141,10 @@ class SshTunnelManager:
             # teardown above is already done, so abandoning the persisted reset
             # would leave was_connected=True plus a stale local_port, reviving
             # an instance the user disconnected and pinning the freed port.
-            await self._persist_hint(
-                self._registry.update,
-                instance_id,
-                was_connected=False,
-                local_port=_UNALLOCATED_PORT,
-            )
+            hints: dict[str, object] = {"local_port": _UNALLOCATED_PORT}
+            if not keep_intent:
+                hints["was_connected"] = False
+            await self._persist_hint(self._registry.update, instance_id, **hints)
             return tunnel is not None
 
     async def shutdown(self) -> None:

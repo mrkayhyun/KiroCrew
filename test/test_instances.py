@@ -1684,6 +1684,312 @@ class TestHandlers:
             == 400
         )
 
+    def test_update_tears_down_a_tunnel_its_own_edit_invalidated(self, tmp_path, monkeypatch):
+        """A tunnel is built from ssh_host/remote_port/connection_method, so editing
+        one of those leaves a live tunnel forwarding the OLD port to the OLD host
+        under the new label. The edit must tear it down, and must keep
+        ``was_connected`` — that flag records an explicit user disconnect, which an
+        edit is not, and clearing it would drop the crew out of the switcher."""
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        reg.set_was_connected("cd-1", True)
+
+        class _Manager:
+            def __init__(self):
+                self.disconnected = []
+
+            async def disconnect(self, instance_id, *, keep_intent=False):
+                self.disconnected.append((instance_id, keep_intent))
+                # Mirror the real manager: the port hint always clears, and the
+                # connect intent clears ONLY for an explicit user disconnect.
+                hints = {"local_port": 0}
+                if not keep_intent:
+                    hints["was_connected"] = False
+                reg.update(instance_id, **hints)
+                return True
+
+            def status(self, instance_id):
+                return None
+
+            def last_error(self, instance_id):
+                return None
+
+        mgr = _Manager()
+        state = _State(reg, manager=mgr)
+        r = asyncio.run(
+            handlers.api_instances_update(
+                _FakeReq(state, match={"id": "cd-1"}, body={"remote_port": 7999})
+            )
+        )
+        assert r.status == 200 and _body(r)["remote_port"] == 7999
+        # Twice: once before the write, then a sweep after it for anything that
+        # raced in on the old coordinates. Both are reconfigurations, so neither
+        # may clear the user's connect intent.
+        assert mgr.disconnected == [("cd-1", True), ("cd-1", True)], (
+            "the stale tunnel was left running, or the teardown claimed to be a "
+            "user disconnect"
+        )
+        inst = reg.get("cd-1")
+        assert inst is not None and inst.was_connected is True
+
+    def test_update_refuses_an_invalid_edit_without_touching_the_tunnel(
+        self, tmp_path, monkeypatch
+    ):
+        """A rejected save must not cost the user their connection: the proposed
+        record is validated before the teardown, so a typo answers 400 with the
+        crew still connected."""
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        reg.set_was_connected("cd-1", True)
+
+        class _Manager:
+            def __init__(self):
+                self.disconnected = []
+
+            async def disconnect(self, instance_id, *, keep_intent=False):
+                self.disconnected.append(instance_id)
+                return True
+
+            def status(self, instance_id):
+                return None
+
+            def last_error(self, instance_id):
+                return None
+
+        mgr = _Manager()
+        state = _State(reg, manager=mgr)
+        r = asyncio.run(
+            handlers.api_instances_update(
+                _FakeReq(state, match={"id": "cd-1"}, body={"ssh_host": "bad host;rm"})
+            )
+        )
+        assert r.status == 400 and _body(r)["code"] == "instance_invalid"
+        assert mgr.disconnected == [], "a rejected edit tore down the tunnel anyway"
+        inst = reg.get("cd-1")
+        assert inst is not None
+        assert inst.ssh_host == "cd-1-alias" and inst.was_connected is True
+
+    def test_update_restores_intent_even_when_the_sweep_found_no_tunnel(
+        self, tmp_path, monkeypatch
+    ):
+        """``disconnect()`` clears the persisted intent whether or not it tracked
+        a live tunnel, and reports False in that case. Restoring only on a True
+        return would drop the crew out of the switcher."""
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        reg.set_was_connected("cd-1", True)
+
+        class _NoTunnelManager:
+            async def disconnect(self, instance_id, *, keep_intent=False):
+                # Mirrors the real manager: the registry cleanup runs even with
+                # no live tunnel tracked, and the return value is False.
+                hints = {"local_port": 0}
+                if not keep_intent:
+                    hints["was_connected"] = False
+                reg.update(instance_id, **hints)
+                return False
+
+            def status(self, instance_id):
+                return None
+
+            def last_error(self, instance_id):
+                return None
+
+        state = _State(reg, manager=_NoTunnelManager())
+        r = asyncio.run(
+            handlers.api_instances_update(
+                _FakeReq(state, match={"id": "cd-1"}, body={"remote_port": 7999})
+            )
+        )
+        assert r.status == 200
+        inst = reg.get("cd-1")
+        assert inst is not None and inst.remote_port == 7999
+        assert inst.was_connected is True, "the crew lost its switcher entry"
+
+    def test_update_does_not_revive_a_crew_disconnected_mid_edit(
+        self, tmp_path, monkeypatch
+    ):
+        """An explicit Disconnect landing while a transport edit is in flight must
+        win. The edit's teardown preserves intent rather than restoring a snapshot
+        of it, so the user's disconnect is not overwritten."""
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        reg.set_was_connected("cd-1", True)
+
+        class _DisconnectMidEdit:
+            def __init__(self):
+                self.calls = 0
+
+            async def disconnect(self, instance_id, *, keep_intent=False):
+                self.calls += 1
+                hints = {"local_port": 0}
+                if not keep_intent:
+                    hints["was_connected"] = False
+                reg.update(instance_id, **hints)
+                if self.calls == 1:
+                    # The user presses Disconnect while the save is in flight.
+                    reg.set_was_connected(instance_id, False)
+                return True
+
+            def status(self, instance_id):
+                return None
+
+            def last_error(self, instance_id):
+                return None
+
+        state = _State(reg, manager=_DisconnectMidEdit())
+        r = asyncio.run(
+            handlers.api_instances_update(
+                _FakeReq(state, match={"id": "cd-1"}, body={"remote_port": 7999})
+            )
+        )
+        assert r.status == 200 and _body(r)["remote_port"] == 7999
+        inst = reg.get("cd-1")
+        assert inst is not None
+        assert inst.was_connected is False, "the edit revived a crew the user disconnected"
+        # The response must report the same thing, so the dashboard does not
+        # reconnect off a stale view.
+        assert _body(r)["was_connected"] is False
+
+    def test_update_sweeps_a_reconnect_that_raced_the_transport_edit(
+        self, tmp_path, monkeypatch
+    ):
+        """The teardown and the registry write are separate awaits, so a tab
+        reconnect can open a tunnel from the OLD coordinates in between. Because
+        connect() is idempotent, that tunnel would then be handed out for the NEW
+        settings indefinitely — a live connection to the previous machine. A
+        second teardown after the write closes the window, and the connect intent
+        it clears is restored."""
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        reg.set_was_connected("cd-1", True)
+
+        class _RacingManager:
+            def __init__(self):
+                self.disconnect_calls = 0
+                self.live = False
+
+            async def disconnect(self, instance_id, *, keep_intent=False):
+                self.disconnect_calls += 1
+                if self.disconnect_calls == 1:
+                    # A reconnect slips in right after the pre-edit teardown,
+                    # built from the coordinates the edit is replacing.
+                    self.live = True
+                    return True
+                self.live = False
+                return True
+
+            def status(self, instance_id):
+                return None
+
+            def last_error(self, instance_id):
+                return None
+
+        mgr = _RacingManager()
+        state = _State(reg, manager=mgr)
+        r = asyncio.run(
+            handlers.api_instances_update(
+                _FakeReq(state, match={"id": "cd-1"}, body={"ssh_host": "cd-2-alias"})
+            )
+        )
+        assert r.status == 200
+        assert mgr.disconnect_calls == 2, "no post-update teardown sweep ran"
+        assert mgr.live is False, "a tunnel on the old coordinates survived the edit"
+        inst = reg.get("cd-1")
+        assert inst is not None
+        assert inst.ssh_host == "cd-2-alias"
+        assert inst.was_connected is True, "the sweep dropped the connect intent"
+
+    def test_update_saves_the_edit_even_when_the_tunnel_teardown_fails(
+        self, tmp_path, monkeypatch
+    ):
+        """A teardown that raises must not strand the user on coordinates they
+        already know are wrong: the record is what the next connect builds from,
+        so the edit is persisted and the failure is logged, not surfaced as a
+        500."""
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        reg.set_was_connected("cd-1", True)
+
+        class _WedgedManager:
+            async def disconnect(self, instance_id, *, keep_intent=False):
+                raise OSError("ssh process will not die")
+
+            def status(self, instance_id):
+                return None
+
+            def last_error(self, instance_id):
+                return None
+
+        state = _State(reg, manager=_WedgedManager())
+        r = asyncio.run(
+            handlers.api_instances_update(
+                _FakeReq(state, match={"id": "cd-1"}, body={"ssh_host": "cd-2-alias"})
+            )
+        )
+        assert r.status == 200 and _body(r)["ssh_host"] == "cd-2-alias"
+        inst = reg.get("cd-1")
+        assert inst is not None and inst.ssh_host == "cd-2-alias"
+        assert inst.was_connected is True
+
+    def test_update_leaves_a_healthy_tunnel_alone_when_only_the_label_changes(
+        self, tmp_path, monkeypatch
+    ):
+        """A rename does not change how the tunnel is opened, so dropping the
+        connection for it would be a self-inflicted outage."""
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+
+        class _Manager:
+            def __init__(self):
+                self.disconnected = []
+
+            async def disconnect(self, instance_id, *, keep_intent=False):
+                self.disconnected.append(instance_id)
+                return True
+
+            def status(self, instance_id):
+                return None
+
+            def last_error(self, instance_id):
+                return None
+
+        mgr = _Manager()
+        state = _State(reg, manager=mgr)
+        # Re-sending the SAME host alongside a new name is still only a rename.
+        r = asyncio.run(
+            handlers.api_instances_update(
+                _FakeReq(
+                    state,
+                    match={"id": "cd-1"},
+                    body={"name": "Renamed", "ssh_host": "cd-1-alias"},
+                )
+            )
+        )
+        assert r.status == 200 and _body(r)["name"] == "Renamed"
+        assert mgr.disconnected == []
+
     def test_remove_success_and_404(self, tmp_path, monkeypatch):
         from kiro_crew.dashboard import handlers_instances as handlers
 

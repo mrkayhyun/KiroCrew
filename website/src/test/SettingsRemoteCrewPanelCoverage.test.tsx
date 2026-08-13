@@ -9,7 +9,7 @@
  * readable record of the defects it was written for.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { act, screen, waitFor } from '@testing-library/react'
+import { act, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { createTestStore, renderWithProviders } from './helpers'
 import type {
@@ -36,6 +36,7 @@ vi.mock('../api/client', () => {
       connectInstance: vi.fn(),
       disconnectInstance: vi.fn(),
       removeInstance: vi.fn(),
+      updateInstance: vi.fn(),
       instanceStatus: vi.fn(),
       patchConfig: vi.fn(),
       cloudLaunches: vi.fn(),
@@ -184,6 +185,12 @@ afterEach(() => {
   vi.useRealTimers()
 })
 
+
+/** Open a crew row's overflow menu — Edit / Stop / Start / Delete / Remove live there. */
+async function openRowMenu(u: ReturnType<typeof setup>, name: RegExp = /More actions/i) {
+  await u.click(await screen.findByRole('button', { name }))
+}
+
 describe('RemoteCrewPanel — instance actions', () => {
   it('reports progress on the clicked Connect, then explains a connect that did not finish', async () => {
     vi.mocked(api.listInstances).mockResolvedValue(list([MANUAL_INSTANCE]))
@@ -252,7 +259,8 @@ describe('RemoteCrewPanel — instance actions', () => {
     const store = storeWithWarm('m1')
     renderWithProviders(<RemoteCrewPanel />, { store })
 
-    await u.click(await screen.findByRole('button', { name: 'Remove dev-box-1' }))
+    await openRowMenu(u)
+    await u.click(await screen.findByRole('menuitem', { name: 'Remove dev-box-1' }))
     await waitFor(() => expect(api.removeInstance).toHaveBeenCalledWith('m1'))
     await waitFor(() => expect(store.getState().instances.warm).not.toHaveProperty('m1'))
   })
@@ -264,7 +272,8 @@ describe('RemoteCrewPanel — instance actions', () => {
     const u = setup()
     renderWithProviders(<RemoteCrewPanel />)
 
-    await u.click(await screen.findByRole('button', { name: 'Remove dev-box-1' }))
+    await openRowMenu(u)
+    await u.click(await screen.findByRole('menuitem', { name: 'Remove dev-box-1' }))
     expect(await screen.findByText(/Remove of m1 failed: registry is locked/, undefined, { timeout: 5_000 })).toBeInTheDocument()
   })
 
@@ -278,7 +287,8 @@ describe('RemoteCrewPanel — instance actions', () => {
     const u = setup()
     renderWithProviders(<RemoteCrewPanel />)
 
-    await u.click(await screen.findByRole('button', { name: 'Diagnose dev-box-1' }))
+    await openRowMenu(u)
+    await u.click(await screen.findByRole('menuitem', { name: 'Diagnose dev-box-1' }))
     expect(await screen.findByText(/m1: host did not answer/, undefined, { timeout: 5_000 })).toBeInTheDocument()
 
     await u.click(screen.getByRole('button', { name: 'Dismiss diagnosis' }))
@@ -293,7 +303,8 @@ describe('RemoteCrewPanel — instance actions', () => {
     const u = setup()
     renderWithProviders(<RemoteCrewPanel />)
 
-    await u.click(await screen.findByRole('button', { name: 'Diagnose dev-box-1' }))
+    await openRowMenu(u)
+    await u.click(await screen.findByRole('menuitem', { name: 'Diagnose dev-box-1' }))
     await waitFor(() => expect(api.instanceStatus).toHaveBeenCalledWith('m1', true))
     expect(screen.queryByRole('status')).not.toBeInTheDocument()
   })
@@ -304,7 +315,8 @@ describe('RemoteCrewPanel — instance actions', () => {
     const u = setup()
     renderWithProviders(<RemoteCrewPanel />)
 
-    await u.click(await screen.findByRole('button', { name: 'Diagnose dev-box-1' }))
+    await openRowMenu(u)
+    await u.click(await screen.findByRole('menuitem', { name: 'Diagnose dev-box-1' }))
     expect(await screen.findByText(/Diagnose of m1 failed: probe blew up/, undefined, { timeout: 5_000 })).toBeInTheDocument()
   })
 
@@ -318,7 +330,8 @@ describe('RemoteCrewPanel — instance actions', () => {
     const u = setup()
     renderWithProviders(<RemoteCrewPanel />)
 
-    await u.click(await screen.findByRole('button', { name: /Remove Kiro Crew Cloud/ }))
+    await openRowMenu(u)
+    await u.click(await screen.findByRole('menuitem', { name: /Remove Kiro Crew Cloud/ }))
     expect(await screen.findByText(/keeps running and billing/i)).toBeInTheDocument()
     await u.click(screen.getByRole('button', { name: /Remove Kiro Crew Cloud/ }))
     await waitFor(() => expect(api.removeInstance).toHaveBeenCalledWith('kc1'))
@@ -333,7 +346,8 @@ describe('RemoteCrewPanel — instance actions', () => {
     const u = setup()
     renderWithProviders(<RemoteCrewPanel />)
 
-    await u.click(await screen.findByRole('button', { name: /^Stop Kiro Crew Cloud/ }))
+    await openRowMenu(u)
+    await u.click(await screen.findByRole('menuitem', { name: /^Stop Kiro Crew Cloud/ }))
     await waitFor(() =>
       expect(api.cloudStop).toHaveBeenCalledWith('kc-3f9a', {
         profile: 'Admin',
@@ -353,7 +367,8 @@ describe('RemoteCrewPanel — instance actions', () => {
     const u = setup()
     renderWithProviders(<RemoteCrewPanel />)
 
-    await u.click(await screen.findByRole('button', { name: /^Start Kiro Crew Cloud/ }))
+    await openRowMenu(u)
+    await u.click(await screen.findByRole('menuitem', { name: /^Start Kiro Crew Cloud/ }))
     expect(await screen.findByText('unknown error', undefined, { timeout: 5_000 })).toBeInTheDocument()
   })
 
@@ -370,7 +385,8 @@ describe('RemoteCrewPanel — instance actions', () => {
     // An absent cap falls back to the default rather than advertising "up to 0".
     expect(await screen.findByText(/Up to 5 stay warm at once/i)).toBeInTheDocument()
 
-    await u.click(await screen.findByRole('button', { name: /^Delete Kiro Crew Cloud/ }))
+    await openRowMenu(u)
+    await u.click(await screen.findByRole('menuitem', { name: /^Delete Kiro Crew Cloud/ }))
     expect(await screen.findByText(/terminates the EC2 instance/i)).toBeInTheDocument()
     await u.click(screen.getByRole('button', { name: /^Confirm deleting/ }))
     expect(await screen.findByRole('button', { name: /Deleting/, hidden: true })).toBeDisabled()
@@ -628,5 +644,171 @@ describe('RemoteCrewPanel — disabled feature gate', () => {
     expect(screen.queryByRole('button', { name: /Enable remote crew management/ })).not.toBeInTheDocument()
     await u.click(screen.getAllByRole('button', { name: 'Refresh' })[0])
     await waitFor(() => expect(vi.mocked(api.listInstances).mock.calls.length).toBeGreaterThan(1))
+  })
+})
+
+describe('RemoteCrewPanel — editing a crew', () => {
+  it('saves an edited host and port to the crew that was already configured', async () => {
+    // Correcting a crew used to mean deleting it and adding it back, which threw
+    // away the record (and its connect history) along with the typo.
+    vi.mocked(api.listInstances).mockResolvedValue(list([MANUAL_INSTANCE]))
+    vi.mocked(api.updateInstance).mockResolvedValue({ ...MANUAL_INSTANCE, ssh_host: 'dev-box-2' })
+    // The host changed, so the save reconnects on the new coordinates.
+    vi.mocked(api.connectInstance).mockResolvedValue({ instance_id: 'm1', state: 'connected', local_port: 7999, token: 't' })
+    const u = setup()
+    renderWithProviders(<RemoteCrewPanel />)
+
+    await openRowMenu(u)
+    await u.click(await screen.findByRole('menuitem', { name: /Edit settings/i }))
+
+    const form = within(await screen.findByRole('group', { name: /Edit dev-box-1/i }))
+    const host = form.getByRole('textbox', { name: /SSH host/i })
+    await u.clear(host)
+    await u.type(host, 'dev-box-2')
+    const port = form.getByRole('textbox', { name: /Remote port/i })
+    await u.clear(port)
+    await u.type(port, '7999')
+    await u.click(form.getByRole('button', { name: /Save changes/i }))
+
+    await waitFor(() =>
+      expect(api.updateInstance).toHaveBeenCalledWith(
+        'm1',
+        expect.objectContaining({ ssh_host: 'dev-box-2', remote_port: 7999 }),
+      ),
+    )
+    // The form closes on success rather than leaving a stale copy of the row open.
+    await waitFor(() => expect(screen.queryByRole('button', { name: /Save changes/i })).not.toBeInTheDocument())
+  })
+
+  it('reopens the tunnel after a transport change, but leaves a rename alone', async () => {
+    // A saved host/port change invalidates the live tunnel, so the crew must not
+    // be left sitting on a forward that points at the old machine. A rename
+    // changes nothing about the transport and must not disturb the connection.
+    const live = { ...MANUAL_INSTANCE, status: { instance_id: 'm1', state: 'connected' as const, local_port: 7777 } }
+    vi.mocked(api.listInstances).mockResolvedValue(list([live]))
+    vi.mocked(api.updateInstance).mockResolvedValue(live)
+    vi.mocked(api.connectInstance).mockResolvedValue({ instance_id: 'm1', state: 'connected', local_port: 7999, token: 't' })
+    const u = setup()
+    renderWithProviders(<RemoteCrewPanel />)
+
+    await openRowMenu(u)
+    await u.click(await screen.findByRole('menuitem', { name: /Edit settings/i }))
+    const form = within(await screen.findByRole('group', { name: /Edit dev-box-1/i }))
+    const name = form.getByRole('textbox', { name: /^Name$/i })
+    await u.clear(name)
+    await u.type(name, 'dev-box-renamed')
+    await u.click(form.getByRole('button', { name: /Save changes/i }))
+    await waitFor(() => expect(api.updateInstance).toHaveBeenCalled())
+    expect(api.connectInstance).not.toHaveBeenCalled()
+
+    await openRowMenu(u)
+    await u.click(await screen.findByRole('menuitem', { name: /Edit settings/i }))
+    const form2 = within(await screen.findByRole('group', { name: /Edit dev-box-1/i }))
+    const port = form2.getByRole('textbox', { name: /Remote port/i })
+    await u.clear(port)
+    await u.type(port, '7999')
+    await u.click(form2.getByRole('button', { name: /Save changes/i }))
+    await waitFor(() => expect(api.connectInstance).toHaveBeenCalledWith('m1'))
+  })
+
+  it('surfaces a rejected save instead of closing as if it worked', async () => {
+    vi.mocked(api.listInstances).mockResolvedValue(list([MANUAL_INSTANCE]))
+    vi.mocked(api.updateInstance).mockRejectedValue(new ApiError(400, 'invalid ssh_host'))
+    const u = setup()
+    renderWithProviders(<RemoteCrewPanel />)
+
+    await openRowMenu(u)
+    await u.click(await screen.findByRole('menuitem', { name: /Edit settings/i }))
+    const form = within(await screen.findByRole('group', { name: /Edit dev-box-1/i }))
+    await u.click(form.getByRole('button', { name: /Save changes/i }))
+
+    expect(await screen.findByText(/invalid ssh_host/, undefined, { timeout: 5_000 })).toBeInTheDocument()
+    expect(form.getByRole('button', { name: /Save changes/i })).toBeInTheDocument()
+  })
+
+  it('actually clears an optional field the user emptied', async () => {
+    // A PATCH is partial, so an omitted key means "leave as-is": emptying the
+    // AWS profile has to travel as an explicit clear or the crew keeps
+    // connecting through a profile that no longer appears anywhere in the form.
+    const ssm = {
+      ...MANUAL_INSTANCE,
+      connection_method: 'ssm' as const,
+      ssm_target: 'i-0abc123456789def0',
+      aws_profile: 'Admin',
+      aws_region: 'us-west-2',
+      ssm_run_as: 'ec2-user',
+    }
+    vi.mocked(api.listInstances).mockResolvedValue(list([ssm]))
+    vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [] })
+    vi.mocked(api.updateInstance).mockResolvedValue({ ...ssm, aws_profile: '' })
+    vi.mocked(api.connectInstance).mockResolvedValue({ instance_id: 'm1', state: 'connected', local_port: 7777, token: 't' })
+    const u = setup()
+    renderWithProviders(<RemoteCrewPanel />)
+
+    await openRowMenu(u)
+    await u.click(await screen.findByRole('menuitem', { name: /Edit settings/i }))
+    const form = within(await screen.findByRole('group', { name: /Edit dev-box-1/i }))
+    await u.clear(form.getByRole('textbox', { name: /AWS profile/i }))
+    await u.click(form.getByRole('button', { name: /Save changes/i }))
+
+    await waitFor(() =>
+      expect(api.updateInstance).toHaveBeenCalledWith('m1', expect.objectContaining({ aws_profile: '' })),
+    )
+    // A cleared remote user falls back to the documented default, which the
+    // registry requires for an SSM crew, rather than to an empty string.
+    expect(vi.mocked(api.updateInstance).mock.calls[0][1]).toMatchObject({ ssm_run_as: 'ec2-user' })
+  })
+
+  it('publishes the reconnected port and token so the pane is not left on the dead origin', async () => {
+    // The new tunnel has a new port and token. If the store keeps the pre-edit
+    // pair, the pane iframe stays on the dead origin AND a later selection sees
+    // a warm+connected crew and skips the reconnect that would have healed it.
+    const live = { ...MANUAL_INSTANCE, was_connected: true, status: { instance_id: 'm1', state: 'connected' as const, local_port: 7777 } }
+    vi.mocked(api.listInstances).mockResolvedValue(list([live]))
+    vi.mocked(api.updateInstance).mockResolvedValue(live)
+    vi.mocked(api.connectInstance).mockResolvedValue({ instance_id: 'm1', state: 'connected', local_port: 7999, token: 'fresh' })
+    const u = setup()
+    const store = storeWithWarm('m1')
+    renderWithProviders(<RemoteCrewPanel />, { store })
+
+    await openRowMenu(u)
+    await u.click(await screen.findByRole('menuitem', { name: /Edit settings/i }))
+    const form = within(await screen.findByRole('group', { name: /Edit dev-box-1/i }))
+    const port = form.getByRole('textbox', { name: /Remote port/i })
+    await u.clear(port)
+    await u.type(port, '7999')
+    await u.click(form.getByRole('button', { name: /Save changes/i }))
+
+    await waitFor(() => expect(api.connectInstance).toHaveBeenCalledWith('m1'))
+    await waitFor(() =>
+      expect(store.getState().instances.warm['m1']).toEqual({ port: 7999, token: 'fresh' }),
+    )
+  })
+
+  it('does not reconnect a crew the user disconnected while the save was in flight', async () => {
+    // The row this form opened with comes from a poll and can be seconds stale,
+    // so the decision to reconnect is read off the PATCH response instead.
+    const live = { ...MANUAL_INSTANCE, was_connected: true, status: { instance_id: 'm1', state: 'connected' as const, local_port: 7777 } }
+    vi.mocked(api.listInstances).mockResolvedValue(list([live]))
+    // The gateway answers with the post-disconnect truth: intent gone, tunnel down.
+    vi.mocked(api.updateInstance).mockResolvedValue({
+      ...live,
+      remote_port: 7999,
+      was_connected: false,
+      status: { instance_id: 'm1', state: 'disconnected' },
+    })
+    const u = setup()
+    renderWithProviders(<RemoteCrewPanel />)
+
+    await openRowMenu(u)
+    await u.click(await screen.findByRole('menuitem', { name: /Edit settings/i }))
+    const form = within(await screen.findByRole('group', { name: /Edit dev-box-1/i }))
+    const port = form.getByRole('textbox', { name: /Remote port/i })
+    await u.clear(port)
+    await u.type(port, '7999')
+    await u.click(form.getByRole('button', { name: /Save changes/i }))
+
+    await waitFor(() => expect(api.updateInstance).toHaveBeenCalled())
+    expect(api.connectInstance).not.toHaveBeenCalled()
   })
 })
